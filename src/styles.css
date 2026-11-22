@@ -24,3 +24,22 @@
 .history-detail .job-panel{margin:14px;max-width:none}
 .history-saved{display:flex;align-items:center;gap:6px;margin:12px 0 0;color:#8dc59d;font-size:10px}
 .muted-small{color:#6f7a7d;margin-left:6px}
+
+
+/* Personal STRATZ API-key settings */
+.api-key-card{max-width:820px}
+.api-key-heading{display:flex;align-items:center;gap:14px;margin:20px 0 18px}
+.api-key-heading .big-card-icon{flex:0 0 auto;margin:0}
+.api-key-heading h3{margin:0 0 5px;font-size:16px}
+.api-key-heading p{margin:0;color:var(--muted);font-size:10px;line-height:1.6}
+.api-key-form{display:flex;flex-direction:column;gap:14px}
+.api-key-form .field-label{gap:8px}
+.api-key-form .field-label small{font:9px Inter,system-ui,sans-serif;color:#77827e;letter-spacing:0;line-height:1.55}
+.api-key-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.api-key-status{display:flex;align-items:center;gap:7px;margin-top:16px;padding-top:13px;border-top:1px solid #2a3131;color:#91b69c;font-size:9px}
+.api-key-status svg{flex:0 0 auto}
+.api-key-info{max-width:820px}
+.api-key-info p{font-size:10px;line-height:1.8;color:#909a98;margin:16px 0}
+.api-key-info a{display:inline-flex;align-items:center;gap:6px;color:#b4c6ba;font-size:10px;text-decoration:none}
+.api-key-info a:hover{color:#e0e9e2}
+@media(max-width:640px){.api-key-actions{align-items:stretch;flex-direction:column}.api-key-actions .button,.api-key-actions .table-action{width:100%;justify-content:center;height:40px}}

@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 
 type User = { id: number; username: string; role: 'admin' | 'user' };
-type Page = 'overview' | 'matches' | 'steam' | 'history' | 'admin';
+type Page = 'overview' | 'matches' | 'steam' | 'history' | 'settings' | 'admin';
 type Job = {
   id: string; kind: 'match' | 'steam'; title: string; status: string; progress: number;
   total: number; rows: { profile: string; price: number | null; status: string }[]; logs: string[]; done: boolean; historyId?: number;
@@ -194,7 +194,7 @@ export default function App() {
     } catch (error) { notify((error as Error).message, 'error'); }
   }
 
-  const pageTitle = useMemo(() => ({ overview: 'Обзор', matches: 'Проверка матчей', steam: 'Проверка Steam-профиля', history: 'История проверок', admin: 'Управление доступом' }[page]), [page]);
+  const pageTitle = useMemo(() => ({ overview: 'Обзор', matches: 'Проверка матчей', steam: 'Проверка Steam-профиля', history: 'История проверок', settings: 'Мои API-ключи', admin: 'Управление доступом' }[page]), [page]);
   const navigate = (target: Page) => { setPage(target); setMobileOpen(false); if (target === 'admin') void loadAdminData(); if (target === 'history') void loadHistory(historyScope); };
 
   if (loadingAuth) return <div className="boot-screen"><div className="boot-mark"><img src="/assets/makerow-dog.png"/><span /></div><p>MAKEROW TEAMWORK</p><small>Подключаем защищённую панель…</small></div>;
@@ -218,6 +218,7 @@ export default function App() {
           <NavButton active={page === 'matches'} icon={<Activity size={17}/>} label="Проверка матчей" onClick={() => navigate('matches')}/>
           <NavButton active={page === 'steam'} icon={<Link2 size={17}/>} label="Steam-профиль" onClick={() => navigate('steam')}/>
           <NavButton active={page === 'history'} icon={<HistoryIcon size={17}/>} label="История проверок" onClick={() => navigate('history')}/>
+          <NavButton active={page === 'settings'} icon={<KeyRound size={17}/>} label="Мои API-ключи" onClick={() => navigate('settings')}/>
         </nav>
         {isAdmin && <>
           <div className="nav-label admin-label">АДМИНИСТРИРОВАНИЕ</div>
@@ -244,6 +245,7 @@ export default function App() {
         {page === 'matches' && <Matches matchId={matchId} setMatchId={setMatchId} onlyOne={onlyOne} setOnlyOne={setOnlyOne} only120={only120} setOnly120={setOnly120} busy={busy} job={matchJob} onSubmit={startMatch}/>} 
         {page === 'steam' && <Steam link={steamLink} setLink={setSteamLink} busy={busy} job={steamJob} onSubmit={startSteam}/>} 
         {page === 'history' && <HistoryPage items={history} isAdmin={isAdmin} scope={historyScope} setScope={(scope) => { setHistoryScope(scope); void loadHistory(scope); }} refresh={() => loadHistory(historyScope)} />}
+        {page === 'settings' && <ApiKeysPage notify={notify} />}
         {page === 'admin' && isAdmin && <AdminPanel
           tab={adminTab} setTab={setAdminTab} users={users} invites={invites} busy={busy}
           uses={inviteUses} setUses={setInviteUses} days={inviteDays} setDays={setInviteDays}
@@ -301,10 +303,67 @@ function Overview({ user, navigate, usersCount }: { user: User; navigate: (page:
   </div>;
 }
 
+function ApiKeysPage({ notify }: { notify: (message: string, kind?: 'ok' | 'error') => void }) {
+  const [token, setToken] = useState('');
+  const [configured, setConfigured] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const result = await api<{ configured: boolean; updated_at: string | null }>('/api/settings/stratz');
+      setConfigured(result.configured);
+      setUpdatedAt(result.updated_at);
+    } catch (error) {
+      notify((error as Error).message, 'error');
+    } finally { setLoading(false); }
+  }, [notify]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await api('/api/settings/stratz', { method: 'PUT', body: JSON.stringify({ token }) });
+      setToken('');
+      await refresh();
+      notify('Твой STRATZ API Key сохранён и зашифрован.');
+    } catch (error) { notify((error as Error).message, 'error'); }
+    finally { setSaving(false); }
+  }
+
+  async function remove() {
+    if (!window.confirm('Удалить сохранённый STRATZ API Key из твоего аккаунта?')) return;
+    setSaving(true);
+    try {
+      await api('/api/settings/stratz', { method: 'DELETE' });
+      setConfigured(false); setUpdatedAt(null); setToken('');
+      notify('STRATZ API Key удалён.');
+    } catch (error) { notify((error as Error).message, 'error'); }
+    finally { setSaving(false); }
+  }
+
+  return <div className="page-stack">
+    <div className="page-intro"><div><div className="eyebrow">PERSONAL API SETTINGS</div><h2>Твои <em>API-ключи</em></h2><p>Каждый участник добавляет собственный ключ STRATZ. Он используется только для проверок, запущенных из этого аккаунта.</p></div><div className="intro-stamp"><KeyRound size={22}/><span>PRIVATE<br/>CREDENTIALS</span></div></div>
+    <section className="surface-card api-key-card">
+      <div className="card-overline"><span>01 / STRATZ GRAPHQL</span><span className={`tag ${configured ? '' : 'muted-tag'}`}>{loading ? 'ПРОВЕРКА…' : configured ? 'КЛЮЧ СОХРАНЁН' : 'КЛЮЧ НЕ ДОБАВЛЕН'}</span></div>
+      <div className="api-key-heading"><div className="big-card-icon"><KeyRound size={20}/></div><div><h3>Личный STRATZ API Key</h3><p>{configured ? 'Ключ уже сохранён для этого аккаунта.' : 'Вставь собственный ключ, чтобы запускать проверку матчей.'}</p></div></div>
+      <form className="api-key-form" onSubmit={save}>
+        <label className="field-label">STRATZ API KEY<div className="input-wrap"><KeyRound size={17}/><input type="password" value={token} onChange={event => setToken(event.target.value)} placeholder={configured ? 'Вставь новый ключ, чтобы заменить текущий' : 'Вставь свой STRATZ API Key'} autoComplete="new-password" minLength={20} maxLength={4096}/></div><small>Получи ключ в личном кабинете STRATZ. Не отправляй его в чат и не публикуй в GitHub.</small></label>
+        <div className="api-key-actions"><button className="button button-primary" disabled={saving || loading || token.trim().length < 20}>{saving ? <><span className="spinner"/> Сохраняем…</> : configured ? 'Заменить API Key' : 'Сохранить API Key'}</button>{configured && <button type="button" className="table-action danger" disabled={saving} onClick={() => void remove()}><X size={14}/> Удалить ключ</button>}</div>
+      </form>
+      {configured && updatedAt && <div className="api-key-status"><ShieldCheck size={15}/><span>Ключ сохранён {new Date(updatedAt).toLocaleString('ru-RU')}</span></div>}
+    </section>
+    <section className="surface-card api-key-info"><div className="card-overline"><span>ВАЖНО О БЕЗОПАСНОСТИ</span><span className="tag">AES-256-GCM</span></div><p>STRATZ API Key шифруется на сервере перед записью в Neon. В интерфейс ключ обратно не передаётся. У каждого аккаунта свой отдельный ключ; администратор не может просмотреть ключи участников.</p><a href="https://stratz.com/" target="_blank" rel="noreferrer">Открыть STRATZ <ExternalLink size={13}/></a></section>
+  </div>;
+}
+
 function Matches({ matchId, setMatchId, onlyOne, setOnlyOne, only120, setOnly120, busy, job, onSubmit }: { matchId: string; setMatchId: (v: string) => void; onlyOne: boolean; setOnlyOne: (v: boolean) => void; only120: boolean; setOnly120: (v: boolean) => void; busy: boolean; job: Job | null; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">MATCH SCANNER <span className="tiny-status">● READY</span></div><h2>Сканирование <em>матча</em></h2><p>Получаем список игроков из STRATZ, после чего запрашиваем оценку каждого инвентаря через LZT Market.</p></div><div className="intro-stamp"><Activity size={22}/><span>DOTA 2<br/>ANALYTICS</span></div></div>
+  return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">MATCH SCANNER <span className="tiny-status">● READY</span></div><h2>Сканирование <em>матча</em></h2><p>Используем твой персональный STRATZ API Key, затем запрашиваем оценку каждого инвентаря через LZT Market.</p></div><div className="intro-stamp"><Activity size={22}/><span>DOTA 2<br/>ANALYTICS</span></div></div>
     <div className="scanner-grid"><form className="surface-card scan-form" onSubmit={onSubmit}><div className="card-overline"><span>01 / INPUT</span><span className="tag">MATCH ID</span></div><h3>Параметры проверки</h3><label className="field-label">ID МАТЧА ИЛИ ССЫЛКА<div className="input-wrap"><Search size={17}/><input required value={matchId} onChange={e => setMatchId(e.target.value)} placeholder="Например, 9099439391"/></div></label><div className="filter-heading"><span>ФИЛЬТР СТОИМОСТИ</span><small>USD · DOTA 2</small></div><ToggleRow checked={onlyOne} onChange={setOnlyOne} title="Инвентари от $1" subtitle="Показывать стоимость от одного доллара"/><ToggleRow checked={only120} onChange={setOnly120} title="Инвентари от $120" subtitle="Только дорогие инвентари от 120 USD"/><div className="filter-note"><CircleHelp size={14}/><span>Если включены оба фильтра, применяется порог $120. Если оба выключены — отображаются все оценки.</span></div><button className="button button-primary submit-wide" disabled={busy}>{busy ? <><span className="spinner"/> Проверяем…</> : <>Запустить сканирование <ArrowRight size={17}/></>}</button></form>
-      <div className="surface-card scan-aside"><div className="card-overline"><span>02 / PIPELINE</span><span className="tag muted-tag">LIVE FLOW</span></div><h3>Этапы обработки</h3><PipelineStep no="01" title="STRATZ API" text="Получаем участников матча и SteamID, если они доступны."/><PipelineStep no="02" title="LZT MARKET" text="Запрашиваем оценку Dota 2 через steam-value. Steam API не используется."/><PipelineStep no="03" title="Результаты и Discord" text="Обновляем статусы, выводим цены и отправляем итог в Discord." last/><div className="aside-foot"><ShieldCheck size={15}/> API-ключи остаются на сервере и не доступны пользователям.</div></div></div>
+      <div className="surface-card scan-aside"><div className="card-overline"><span>02 / PIPELINE</span><span className="tag muted-tag">LIVE FLOW</span></div><h3>Этапы обработки</h3><PipelineStep no="01" title="STRATZ API" text="Получаем участников матча и SteamID, если они доступны."/><PipelineStep no="02" title="LZT MARKET" text="Запрашиваем оценку Dota 2 через steam-value. Steam API не используется."/><PipelineStep no="03" title="Результаты и Discord" text="Обновляем статусы, выводим цены и отправляем итог в Discord." last/><div className="aside-foot"><ShieldCheck size={15}/> STRATZ-ключ каждого участника хранится отдельно в зашифрованном виде.</div></div></div>
     {job && <JobPanel job={job} title="Результаты матча"/>}
   </div>;
 }

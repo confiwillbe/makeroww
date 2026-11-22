@@ -4,7 +4,7 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { Pool, neonConfig } from '@neondatabase/serverless';
 import argon2 from 'argon2';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
 
 if (typeof WebSocket !== 'undefined') neonConfig.webSocketConstructor = WebSocket;
 
@@ -89,6 +89,13 @@ async function ensureDatabase(): Promise<void> {
       rate_key TEXT PRIMARY KEY,
       next_request_at BIGINT NOT NULL
     )`);
+    await db.query(`CREATE TABLE IF NOT EXISTS user_api_credentials (
+      user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      stratz_token_ciphertext TEXT NOT NULL,
+      stratz_token_iv TEXT NOT NULL,
+      stratz_token_tag TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
     await db.query('CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id)');
     await db.query(`CREATE TABLE IF NOT EXISTS check_history (
       id BIGSERIAL PRIMARY KEY,
@@ -131,6 +138,39 @@ async function ensureDatabase(): Promise<void> {
 function nowUnix(): number { return Math.floor(Date.now() / 1000); }
 function sha256(value: string): string { return createHash('sha256').update(value).digest('hex'); }
 function randomToken(bytes = 32): string { return randomBytes(bytes).toString('base64url'); }
+function getApiEncryptionKey(): Buffer {
+  const encoded = (process.env.APP_ENCRYPTION_KEY || '').trim();
+  const key = Buffer.from(encoded, 'base64');
+  if (key.length !== 32) {
+    fail(503, 'Администратор не настроил APP_ENCRYPTION_KEY. Добавь 32-байтовый Base64-ключ в Vercel → Settings → Environment Variables и сделай Redeploy.');
+  }
+  return key;
+}
+function encryptApiSecret(value: string): { ciphertext: string; iv: string; tag: string } {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', getApiEncryptionKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  return { ciphertext: ciphertext.toString('base64'), iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64') };
+}
+function decryptApiSecret(ciphertext: string, iv: string, tag: string): string {
+  const key = getApiEncryptionKey();
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(tag, 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]).toString('utf8');
+  } catch {
+    fail(503, 'Не удалось расшифровать STRATZ API Key. Проверь APP_ENCRYPTION_KEY: он должен совпадать с ключом, использованным при сохранении.');
+  }
+}
+async function getUserStratzToken(userId: number): Promise<string | null> {
+  const result = await getPool().query(
+    'SELECT stratz_token_ciphertext, stratz_token_iv, stratz_token_tag FROM user_api_credentials WHERE user_id = $1',
+    [userId]
+  );
+  const row = result.rows[0] as { stratz_token_ciphertext: string; stratz_token_iv: string; stratz_token_tag: string } | undefined;
+  if (!row) return null;
+  return decryptApiSecret(row.stratz_token_ciphertext, row.stratz_token_iv, row.stratz_token_tag);
+}
 function asyncRoute(fn: (req: Request, res: ExpressResponse) => Promise<unknown>): RequestHandler {
   return (req, res, next) => { void fn(req, res).catch(next); };
 }
@@ -235,9 +275,7 @@ function getBigInt(value: unknown): bigint | null {
   if (typeof value === 'string' && /^\d+$/.test(value)) { try { return BigInt(value); } catch { return null; } }
   return null;
 }
-async function stratzPlayers(matchId: bigint): Promise<{ ids: bigint[]; totalSlots: number; missing: number }> {
-  const token = process.env.STRATZ_API_TOKEN || '';
-  if (!token.trim()) throw new Error('На сервере не задан STRATZ_API_TOKEN');
+async function stratzPlayers(matchId: bigint, token: string): Promise<{ ids: bigint[]; totalSlots: number; missing: number }> {
   const query = `{match(id:${matchId}){players{steamAccountId steamAccount{id isAnonymous}}}}`;
   const response = await fetch('https://api.stratz.com/graphql', {
     method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, 'user-agent': 'STRATZ_API' },
@@ -372,11 +410,11 @@ async function discordSend(content: string): Promise<void> {
   const body = await response.text();
   if (!response.ok) throw new Error(`Discord HTTP ${response.status}: ${shortText(body)}`);
 }
-async function runMatchJob(job: Job, matchId: bigint, onlyOverOne: boolean, onlyOver120: boolean): Promise<void> {
+async function runMatchJob(job: Job, matchId: bigint, stratzToken: string, onlyOverOne: boolean, onlyOver120: boolean): Promise<void> {
   job.status = 'Получаю игроков из STRATZ…';
   pushLog(job, `Пользователь: ${job.ownerName}. Матч: ${matchId}`);
   let roster: Awaited<ReturnType<typeof stratzPlayers>>;
-  try { roster = await stratzPlayers(matchId); }
+  try { roster = await stratzPlayers(matchId, stratzToken); }
   catch (error) { pushLog(job, error instanceof Error ? error.message : String(error)); job.status = 'Ошибка получения состава матча'; job.done = true; return; }
   const total = roster.ids.length;
   job.total = total;
@@ -606,13 +644,38 @@ app.post('/api/admin/users/:id/reset-password', auth, asyncRoute(async (req, res
   res.json({ ok: true, temporary_password: password });
 }));
 
+app.get('/api/settings/stratz', auth, asyncRoute(async (req, res) => {
+  const result = await getPool().query('SELECT updated_at FROM user_api_credentials WHERE user_id = $1', [req.user!.id]);
+  res.json({ configured: Boolean(result.rowCount), updated_at: result.rows[0]?.updated_at ?? null });
+}));
+app.put('/api/settings/stratz', auth, asyncRoute(async (req, res) => {
+  const token = String(req.body?.token || '').trim().replace(/^Bearer\s+/i, '');
+  if (token.length < 20 || token.length > 4096) fail(400, 'Вставь корректный STRATZ API Key (от 20 до 4096 символов)');
+  const encrypted = encryptApiSecret(token);
+  await getPool().query(
+    `INSERT INTO user_api_credentials (user_id, stratz_token_ciphertext, stratz_token_iv, stratz_token_tag, updated_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET stratz_token_ciphertext = EXCLUDED.stratz_token_ciphertext,
+       stratz_token_iv = EXCLUDED.stratz_token_iv, stratz_token_tag = EXCLUDED.stratz_token_tag, updated_at = NOW()`,
+    [req.user!.id, encrypted.ciphertext, encrypted.iv, encrypted.tag]
+  );
+  res.json({ ok: true, configured: true });
+}));
+app.delete('/api/settings/stratz', auth, asyncRoute(async (req, res) => {
+  await getPool().query('DELETE FROM user_api_credentials WHERE user_id = $1', [req.user!.id]);
+  res.json({ ok: true, configured: false });
+}));
+
 app.post('/api/check/match', auth, checkLimiter, asyncRoute(async (req, res) => {
   const raw = String(req.body?.match_id || '').trim();
   const matchId = parseNumericId(raw);
   if (!matchId || matchId <= 0n || raw.length > 120) fail(400, 'Введи корректный ID матча Dota 2');
-  if (!(process.env.STRATZ_API_TOKEN || '').trim() || !(process.env.LZT_API_TOKEN || '').trim()) fail(503, 'Администратор ещё не настроил STRATZ/LZT API на сервере');
-  const job = createJob(currentUser(req), 'match', `Матч ${matchId}`);
-  try { await runMatchJob(job, matchId, Boolean(req.body?.only_over_one), Boolean(req.body?.only_over_120)); }
+  const user = currentUser(req);
+  const stratzToken = await getUserStratzToken(user.id);
+  if (!stratzToken) fail(400, 'Сначала добавь свой STRATZ API Key в разделе «Мои API-ключи»');
+  if (!(process.env.LZT_API_TOKEN || '').trim()) fail(503, 'Администратор ещё не настроил LZT_API_TOKEN на сервере');
+  const job = createJob(user, 'match', `Матч ${matchId}`);
+  try { await runMatchJob(job, matchId, stratzToken, Boolean(req.body?.only_over_one), Boolean(req.body?.only_over_120)); }
   finally { job.historyId = await saveHistory(job); }
   res.json(safeJob(job));
 }));
