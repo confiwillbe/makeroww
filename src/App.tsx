@@ -1,17 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
   Activity, ArrowDownRight, ArrowLeft, ArrowRight, Ban, Check, CheckCircle2, CircleHelp,
   Clipboard, Clock3, Copy, Crown, ExternalLink, Eye, EyeOff, Gauge, Gem, Globe2, KeyRound,
   LayoutDashboard, Link2, LogOut, Menu, MoreHorizontal, Plus, RefreshCw, Search, Shield,
-  ShieldCheck, Skull, Sparkles, User, UserCheck, UserPlus, Users, Wallet, X, Zap
+  ShieldCheck, Skull, Sparkles, User, UserCheck, UserPlus, Users, Wallet, X, Zap, History as HistoryIcon
 } from 'lucide-react';
 
 type User = { id: number; username: string; role: 'admin' | 'user' };
-type Page = 'overview' | 'matches' | 'steam' | 'admin';
+type Page = 'overview' | 'matches' | 'steam' | 'history' | 'admin';
 type Job = {
   id: string; kind: 'match' | 'steam'; title: string; status: string; progress: number;
-  total: number; rows: { profile: string; price: number | null; status: string }[]; logs: string[]; done: boolean;
+  total: number; rows: { profile: string; price: number | null; status: string }[]; logs: string[]; done: boolean; historyId?: number;
+};
+type HistoryItem = {
+  id: number; user_id: number; username: string; kind: 'match' | 'steam'; title: string; status: string;
+  total: number; progress: number; rows: { profile: string; price: number | null; status: string }[];
+  logs?: string[]; created_at: string;
 };
 type AdminUser = {
   id: number; username: string; role: string; active: number; banned: number;
@@ -34,6 +39,12 @@ const api = async <T,>(path: string, options: RequestInit = {}): Promise<T> => {
 };
 
 function money(value: number | null): string { return value === null ? '—' : `$${value.toFixed(2)}`; }
+function uidLabel(id: number): string { return `UID ${String(id).padStart(5, '0')}`; }
+function dateTimeLabel(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString('ru-RU', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
 function dateLabel(value: string | number): string {
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value.replace(' ', 'T') + (value.includes('Z') ? '' : 'Z'));
   if (Number.isNaN(date.getTime())) return String(value);
@@ -61,11 +72,18 @@ export default function App() {
   const [steamLink, setSteamLink] = useState('');
   const [matchJob, setMatchJob] = useState<Job | null>(null);
   const [steamJob, setSteamJob] = useState<Job | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [historyScope, setHistoryScope] = useState<'mine' | 'all'>('mine');
 
   const notify = useCallback((message: string, kind: 'ok' | 'error' = 'ok') => {
     setToast({ message, kind });
     window.setTimeout(() => setToast(null), 4200);
   }, []);
+
+  const loadHistory = useCallback(async (scope: 'mine' | 'all') => {
+    try { setHistory(await api<HistoryItem[]>(scope === 'all' ? '/api/admin/history' : '/api/history')); }
+    catch (error) { notify((error as Error).message, 'error'); }
+  }, [notify]);
 
   const loadMe = useCallback(async () => {
     try {
@@ -107,7 +125,7 @@ export default function App() {
 
   async function logout() {
     try { await api('/api/auth/logout', { method: 'POST' }); } catch { /* cookie may already be expired */ }
-    setUser(null); setAuthMode('login'); setPage('overview'); setMatchJob(null); setSteamJob(null); setNewInvite(null); setCredential(null);
+    setUser(null); setAuthMode('login'); setPage('overview'); setMatchJob(null); setSteamJob(null); setNewInvite(null); setCredential(null); setHistory([]); setHistoryScope('mine');
   }
 
   async function startMatch(event: FormEvent<HTMLFormElement>) {
@@ -176,8 +194,8 @@ export default function App() {
     } catch (error) { notify((error as Error).message, 'error'); }
   }
 
-  const pageTitle = useMemo(() => ({ overview: 'Обзор', matches: 'Проверка матчей', steam: 'Проверка Steam-профиля', admin: 'Управление доступом' }[page]), [page]);
-  const navigate = (target: Page) => { setPage(target); setMobileOpen(false); if (target === 'admin') void loadAdminData(); };
+  const pageTitle = useMemo(() => ({ overview: 'Обзор', matches: 'Проверка матчей', steam: 'Проверка Steam-профиля', history: 'История проверок', admin: 'Управление доступом' }[page]), [page]);
+  const navigate = (target: Page) => { setPage(target); setMobileOpen(false); if (target === 'admin') void loadAdminData(); if (target === 'history') void loadHistory(historyScope); };
 
   if (loadingAuth) return <div className="boot-screen"><div className="boot-mark"><img src="/assets/makerow-dog.png"/><span /></div><p>MAKEROW TEAMWORK</p><small>Подключаем защищённую панель…</small></div>;
 
@@ -199,6 +217,7 @@ export default function App() {
           <NavButton active={page === 'overview'} icon={<LayoutDashboard size={17}/>} label="Обзор" onClick={() => navigate('overview')}/>
           <NavButton active={page === 'matches'} icon={<Activity size={17}/>} label="Проверка матчей" onClick={() => navigate('matches')}/>
           <NavButton active={page === 'steam'} icon={<Link2 size={17}/>} label="Steam-профиль" onClick={() => navigate('steam')}/>
+          <NavButton active={page === 'history'} icon={<HistoryIcon size={17}/>} label="История проверок" onClick={() => navigate('history')}/>
         </nav>
         {isAdmin && <>
           <div className="nav-label admin-label">АДМИНИСТРИРОВАНИЕ</div>
@@ -208,7 +227,7 @@ export default function App() {
           <div className="system-status"><span className="pulse-dot"/><span>Система активна</span><span className="status-right">LIVE</span></div>
           <div className="profile-mini">
             <div className="profile-avatar">{user.username.slice(0, 1).toUpperCase()}</div>
-            <div className="profile-meta"><strong>{user.username}</strong><span>{isAdmin ? 'Администратор' : 'Участник команды'}</span></div>
+            <div className="profile-meta"><strong>{user.username}</strong><span>{uidLabel(user.id)} · {isAdmin ? 'Админ' : 'Участник'}</span></div>
             {isAdmin && <Crown size={14} className="crown-icon"/>}
             <button className="icon-button logout-mini" title="Выйти" onClick={logout}><LogOut size={16}/></button>
           </div>
@@ -224,6 +243,7 @@ export default function App() {
         {page === 'overview' && <Overview user={user} navigate={navigate} usersCount={users.length} />}
         {page === 'matches' && <Matches matchId={matchId} setMatchId={setMatchId} onlyOne={onlyOne} setOnlyOne={setOnlyOne} only120={only120} setOnly120={setOnly120} busy={busy} job={matchJob} onSubmit={startMatch}/>} 
         {page === 'steam' && <Steam link={steamLink} setLink={setSteamLink} busy={busy} job={steamJob} onSubmit={startSteam}/>} 
+        {page === 'history' && <HistoryPage items={history} isAdmin={isAdmin} scope={historyScope} setScope={(scope) => { setHistoryScope(scope); void loadHistory(scope); }} refresh={() => loadHistory(historyScope)} />}
         {page === 'admin' && isAdmin && <AdminPanel
           tab={adminTab} setTab={setAdminTab} users={users} invites={invites} busy={busy}
           uses={inviteUses} setUses={setInviteUses} days={inviteDays} setDays={setInviteDays}
@@ -270,7 +290,7 @@ function AuthScreen({ mode, setMode, onSubmit, busy, toast }: { mode: 'login' | 
 
 function Overview({ user, navigate, usersCount }: { user: User; navigate: (page: Page) => void; usersCount: number }) {
   return <div className="page-stack">
-    <section className="welcome-banner"><div className="welcome-noise"/><div className="welcome-content"><div className="eyebrow">TEAM WORKSPACE <span className="eyebrow-line"/></div><h2>Рады видеть, <em>{user.username}</em></h2><p>Все инструменты проверки Dota 2 и Steam — в одном месте.</p><button className="button button-light" onClick={() => navigate('matches')}>Открыть проверку матча <ArrowRight size={16}/></button></div><div className="welcome-orb"><img src="/assets/makerow-dog.png"/></div><div className="banner-index">01 <i>/</i> 03</div></section>
+    <section className="welcome-banner"><div className="welcome-noise"/><div className="welcome-content"><div className="eyebrow">TEAM WORKSPACE <span className="eyebrow-line"/></div><h2>Рады видеть, <em>{user.username}</em></h2><p>Все инструменты проверки Dota 2 и Steam — в одном месте. <span className="uid-chip">{uidLabel(user.id)}</span></p><button className="button button-light" onClick={() => navigate('matches')}>Открыть проверку матча <ArrowRight size={16}/></button></div><div className="welcome-orb"><img src="/assets/makerow-dog.png"/></div><div className="banner-index">01 <i>/</i> 03</div></section>
     <div className="section-heading"><div><span className="eyebrow">YOUR WORKSPACE</span><h2>Рабочая область</h2></div><div className="live-chip"><span/> ВСЁ СИСТЕМЫ ONLINE</div></div>
     <div className="feature-grid">
       <button className="feature-card" onClick={() => navigate('matches')}><div className="feature-top"><div className="feature-icon"><Activity size={19}/></div><ArrowDownRight size={17}/></div><div><h3>Проверка матчей</h3><p>Получи состав матча и проверь стоимость инвентарей через LZT Market.</p></div><div className="feature-foot"><span>STRATZ · LZT MARKET</span><span>ОТКРЫТЬ <ArrowRight size={13}/></span></div></button>
@@ -297,11 +317,60 @@ function PipelineStep({ no, title, text, last }: { no: string; title: string; te
 function Steam({ link, setLink, busy, job, onSubmit }: { link: string; setLink: (v: string) => void; busy: boolean; job: Job | null; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">STEAM VALUE LOOKUP</div><h2>Проверка <em>профиля</em></h2><p>Вставь публичную Steam-ссылку или SteamID64. Стоимость инвентаря запрашивается через LZT Market.</p></div><div className="intro-stamp"><Wallet size={22}/><span>INVENTORY<br/>VALUE</span></div></div><div className="surface-card steam-card"><div className="card-overline"><span>PROFILE LOOKUP</span><span className="tag">LZT MARKET</span></div><h3>Введи ссылку на Steam-профиль</h3><form className="steam-form" onSubmit={onSubmit}><label className="field-label">STEAM PROFILE URL<div className="input-wrap"><Link2 size={17}/><input required value={link} onChange={e => setLink(e.target.value)} placeholder="https://steamcommunity.com/id/... или SteamID64"/></div></label><button className="button button-primary" disabled={busy}>{busy ? <><span className="spinner"/> Проверяем…</> : <>Оценить инвентарь <ArrowRight size={17}/></>}</button></form><div className="steam-help"><ShieldCheck size={15}/><span>Чекер не обращается к Steam — оценка выполняется через LZT Market API.</span></div></div>{job && <JobPanel job={job} title="Результат проверки профиля"/>}</div>;
 }
-function JobPanel({ job, title }: { job: Job; title: string }) {
+function JobPanel({ job, title, archive }: { job: Job; title: string; archive?: boolean }) {
   const percent = job.total ? Math.min(100, job.progress / job.total * 100) : 0;
-  return <section className="surface-card job-panel"><div className="job-head"><div><div className="card-overline"><span>LIVE CHECK</span><span className="job-id">ID {job.id.slice(0, 8).toUpperCase()}</span></div><h3>{title}</h3></div><span className={`job-state ${job.done ? 'done' : 'running'}`}>{job.done ? 'ЗАВЕРШЕНО' : 'В ПРОЦЕССЕ'}</span></div><div className="job-status-line"><span>{job.status}</span><b>{job.progress} / {job.total || '—'}</b></div><div className="progress-rail"><i style={{ width: `${percent}%` }}/></div><div className="job-results">{job.rows.map((row, i) => <div className="job-row" key={`${row.profile}-${i}`}><div className="job-player"><span className="job-player-no">{String(i + 1).padStart(2, '0')}</span><a href={row.profile} target="_blank" rel="noreferrer">{row.profile}<ExternalLink size={12}/></a></div><div className="job-player-result"><strong className={row.price === null ? 'no-price' : ''}>{money(row.price)}</strong><span className={row.price !== null ? 'positive' : /ошибка|скрыт/i.test(row.status) ? 'negative' : ''}>{row.status}</span></div></div>)}</div><div className="job-log"><div className="log-label"><span>EVENT LOG</span><span>{job.logs.length} СОБЫТИЙ</span></div><pre>{job.logs.join('\n') || 'Ожидание событий…'}</pre></div></section>;
+  return <section className="surface-card job-panel"><div className="job-head"><div><div className="card-overline"><span>{archive ? 'ARCHIVE' : 'LIVE CHECK'}</span><span className="job-id">{archive ? `#${job.id}` : `ID ${job.id.slice(0, 8).toUpperCase()}`}</span></div><h3>{title}</h3></div><span className={`job-state ${job.done ? 'done' : 'running'}`}>{job.done ? 'ЗАВЕРШЕНО' : 'В ПРОЦЕССЕ'}</span></div><div className="job-status-line"><span>{job.status}</span><b>{job.progress} / {job.total || '—'}</b></div><div className="progress-rail"><i style={{ width: `${percent}%` }}/></div>{job.historyId && !archive ? <div className="history-saved"><Check size={13}/> Сохранено в историю проверок · запись #{job.historyId}</div> : null}<div className="job-results">{job.rows.map((row, i) => <div className="job-row" key={`${row.profile}-${i}`}><div className="job-player"><span className="job-player-no">{String(i + 1).padStart(2, '0')}</span><a href={row.profile} target="_blank" rel="noreferrer">{row.profile}<ExternalLink size={12}/></a></div><div className="job-player-result"><strong className={row.price === null ? 'no-price' : ''}>{money(row.price)}</strong><span className={row.price !== null ? 'positive' : /ошибка|скрыт/i.test(row.status) ? 'negative' : ''}>{row.status}</span></div></div>)}</div><div className="job-log"><div className="log-label"><span>EVENT LOG</span><span>{job.logs.length} СОБЫТИЙ</span></div><pre>{job.logs.join('\n') || 'Ожидание событий…'}</pre></div></section>;
 }
 
+function HistoryPage({ items, isAdmin, scope, setScope, refresh }: { items: HistoryItem[]; isAdmin: boolean; scope: 'mine' | 'all'; setScope: (scope: 'mine' | 'all') => void; refresh: () => void }) {
+  const [query, setQuery] = useState('');
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [detail, setDetail] = useState<HistoryItem | null>(null);
+  const [detailError, setDetailError] = useState('');
+  const [detailBusy, setDetailBusy] = useState(false);
+  const q = query.trim().toLowerCase().replace(/^uid\s*/, '');
+  const visible = !q ? items : items.filter(item => item.username.toLowerCase().includes(q) || String(item.user_id).padStart(5, '0').includes(q) || item.title.toLowerCase().includes(q));
+  const showUser = scope === 'all';
+  async function toggle(item: HistoryItem) {
+    if (openId === item.id) { setOpenId(null); setDetail(null); return; }
+    setOpenId(item.id); setDetail(null); setDetailError(''); setDetailBusy(true);
+    try { setDetail(await api<HistoryItem>(`/api/history/${item.id}`)); }
+    catch (error) { setDetailError((error as Error).message); }
+    finally { setDetailBusy(false); }
+  }
+  function changeScope(next: 'mine' | 'all') { setOpenId(null); setDetail(null); setQuery(''); setScope(next); }
+  return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">CHECK HISTORY <span className="tiny-status">● СОХРАНЯЕТСЯ НАВСЕГДА</span></div><h2>История <em>проверок</em></h2><p>Каждая проверка матча или Steam-профиля сохраняется в аккаунте пользователя: результаты, статусы и журнал событий.</p></div><div className="intro-stamp"><HistoryIcon size={22}/><span>ARCHIVE<br/>LOG</span></div></div>
+    {isAdmin && <div className="admin-tabs"><button className={scope === 'mine' ? 'active' : ''} onClick={() => changeScope('mine')}><User size={16}/> Мои проверки</button><button className={scope === 'all' ? 'active' : ''} onClick={() => changeScope('all')}><Users size={16}/> Вся команда</button><button className="refresh-admin" onClick={refresh}><RefreshCw size={15}/> Обновить</button></div>}
+    <section className="surface-card table-card"><div className="table-heading"><div><span className="eyebrow">{showUser ? 'TEAM LOG' : 'YOUR LOG'}</span><h3>{showUser ? 'Проверки всей команды' : 'Мои проверки'}</h3></div><span className="table-count">{visible.length} ЗАПИСЕЙ</span></div>
+      <div className="history-toolbar"><div className="input-wrap"><Search size={16}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder={showUser ? 'Поиск: ник, UID или ID матча' : 'Поиск по ID матча или ссылке'}/></div>{!isAdmin && <button className="table-action" onClick={refresh}><RefreshCw size={14}/> Обновить</button>}</div>
+      {!visible.length ? <div className="empty-table"><Clock3 size={24}/><b>Проверок пока нет</b><span>Запусти проверку матча или Steam-профиля, и она появится здесь.</span></div>
+      : <div className="table-scroll"><table className="data-table history-table"><thead><tr><th>ДАТА</th>{showUser && <th>ПОЛЬЗОВАТЕЛЬ</th>}<th>ТИП</th><th>ЗАПРОС</th><th>ЛУЧШАЯ ОЦЕНКА</th><th>СТАТУС</th><th/></tr></thead><tbody>
+        {visible.map(item => {
+          const priced = item.rows.filter(row => row.price !== null);
+          const best = priced.length ? Math.max(...priced.map(row => row.price as number)) : null;
+          const open = openId === item.id;
+          const tone = item.status === 'Проверка завершена' ? 'green' : /ошибка|прервано/i.test(item.status) ? 'red' : 'amber';
+          return <Fragment key={item.id}>
+            <tr className={`history-row ${open ? 'open' : ''}`} onClick={() => void toggle(item)}>
+              <td>{dateTimeLabel(item.created_at)}</td>
+              {showUser && <td><div className="user-cell"><div className="user-table-avatar">{item.username[0]?.toUpperCase()}</div><div><b>{item.username}</b><small>{uidLabel(item.user_id)}</small></div></div></td>}
+              <td>{item.kind === 'match' ? 'Матч' : 'Steam'}</td>
+              <td>{item.title.length > 46 ? `${item.title.slice(0, 46)}…` : item.title}</td>
+              <td>{best === null ? '—' : money(best)} <small className="muted-small">{priced.length}/{item.total || 0} оценено</small></td>
+              <td><span className={`status-badge ${tone}`}><i/>{item.status}</span></td>
+              <td><span className="history-open">{open ? 'СВЕРНУТЬ' : 'ОТКРЫТЬ'}</span></td>
+            </tr>
+            {open && <tr className="history-detail"><td colSpan={showUser ? 7 : 6}>
+              {detailBusy ? <div className="empty-table"><span className="spinner"/><span>Загружаем запись…</span></div>
+              : detailError ? <div className="auth-toast error">{detailError}</div>
+              : detail && <JobPanel archive title={detail.kind === 'match' ? 'Результаты матча' : 'Результат проверки профиля'} job={{ id: String(detail.id), kind: detail.kind, title: detail.title, status: detail.status, progress: detail.progress, total: detail.total, rows: detail.rows, logs: detail.logs || [], done: true }}/>}
+            </td></tr>}
+          </Fragment>;
+        })}
+      </tbody></table></div>}
+    </section>
+  </div>;
+}
 function AdminPanel({ tab, setTab, users, invites, busy, uses, setUses, days, setDays, newInvite, setNewInvite, credential, setCredential, createInvite, revokeInvite, banUser, unbanUser, toggleUser, resetPassword, refresh }: {
   tab: 'users' | 'invites'; setTab: (tab: 'users' | 'invites') => void; users: AdminUser[]; invites: Invite[]; busy: boolean;
   uses: string; setUses: (v: string) => void; days: string; setDays: (v: string) => void;

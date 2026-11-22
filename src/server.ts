@@ -14,7 +14,7 @@ interface PlayerRow { profile: string; price: number | null; status: string; }
 interface Job {
   id: string; kind: 'match' | 'steam'; title: string; status: string;
   progress: number; total: number; rows: PlayerRow[]; logs: string[]; done: boolean;
-  ownerId: number; ownerName: string;
+  ownerId: number; ownerName: string; historyId?: number;
 }
 interface SafeJob extends Omit<Job, 'ownerId' | 'ownerName'> {}
 interface InviteRow {
@@ -90,6 +90,20 @@ async function ensureDatabase(): Promise<void> {
       next_request_at BIGINT NOT NULL
     )`);
     await db.query('CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id)');
+    await db.query(`CREATE TABLE IF NOT EXISTS check_history (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id),
+      username TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      total INTEGER NOT NULL DEFAULT 0,
+      progress INTEGER NOT NULL DEFAULT 0,
+      result_rows JSONB NOT NULL DEFAULT '[]'::jsonb,
+      event_logs JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+    await db.query('CREATE INDEX IF NOT EXISTS check_history_user_idx ON check_history(user_id, id DESC)');
 
     const adminUsername = (process.env.ADMIN_USERNAME || 'admin').trim();
     const adminPassword = process.env.ADMIN_PASSWORD || '';
@@ -183,6 +197,28 @@ function createJob(user: AuthUser, kind: Job['kind'], title: string): Job {
   const id = randomToken(18);
   const job: Job = { id, kind, title, status: 'В очереди', progress: 0, total: 0, rows: [], logs: [], done: false, ownerId: user.id, ownerName: user.username };
   return job;
+}
+async function saveHistory(job: Job): Promise<number | undefined> {
+  try {
+    if (!job.done) { job.status = 'Прервано из-за ошибки'; job.done = true; }
+    const result = await getPool().query(
+      `INSERT INTO check_history (user_id, username, kind, title, status, total, progress, result_rows, event_logs)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb) RETURNING id`,
+      [job.ownerId, job.ownerName, job.kind, job.title, job.status, job.total, job.progress, JSON.stringify(job.rows), JSON.stringify(job.logs)]
+    );
+    return Number(result.rows[0].id);
+  } catch (error) {
+    console.error('Не удалось сохранить историю проверки', error);
+    return undefined;
+  }
+}
+function historyView(row: any, withLogs: boolean) {
+  const view: Record<string, unknown> = {
+    id: Number(row.id), user_id: Number(row.user_id), username: row.username, kind: row.kind, title: row.title,
+    status: row.status, total: Number(row.total), progress: Number(row.progress), rows: row.result_rows, created_at: row.created_at
+  };
+  if (withLogs) view.logs = row.event_logs;
+  return view;
 }
 function shortText(input: string, max = 220): string { return input.replace(/[\r\n\t]+/g, ' ').slice(0, max); }
 function parseNumericId(input: string): bigint | null {
@@ -489,6 +525,7 @@ app.post('/api/auth/logout', asyncRoute(async (req, res) => {
 }));
 app.get('/api/auth/me', auth, (req, res) => res.json({ id: req.user!.id, username: req.user!.username, role: req.user!.role }));
 
+app.use('/api/admin', auth, adminOnly);
 app.get('/api/admin/users', auth, asyncRoute(async (_req, res) => {
   const result = await getPool().query('SELECT id, username, role, active, banned, ban_reason, created_at FROM users ORDER BY id ASC');
   res.json(result.rows.map(row => ({ ...row, id: Number(row.id), active: row.active ? 1 : 0, banned: row.banned ? 1 : 0 })));
@@ -575,15 +612,35 @@ app.post('/api/check/match', auth, checkLimiter, asyncRoute(async (req, res) => 
   if (!matchId || matchId <= 0n || raw.length > 120) fail(400, 'Введи корректный ID матча Dota 2');
   if (!(process.env.STRATZ_API_TOKEN || '').trim() || !(process.env.LZT_API_TOKEN || '').trim()) fail(503, 'Администратор ещё не настроил STRATZ/LZT API на сервере');
   const job = createJob(currentUser(req), 'match', `Матч ${matchId}`);
-  await runMatchJob(job, matchId, Boolean(req.body?.only_over_one), Boolean(req.body?.only_over_120));
+  try { await runMatchJob(job, matchId, Boolean(req.body?.only_over_one), Boolean(req.body?.only_over_120)); }
+  finally { job.historyId = await saveHistory(job); }
   res.json(safeJob(job));
 }));
 app.post('/api/check/steam', auth, checkLimiter, asyncRoute(async (req, res) => {
   const link = normalizeSteamLink(String(req.body?.link || ''));
   if (!(process.env.LZT_API_TOKEN || '').trim()) fail(503, 'Администратор ещё не настроил LZT API на сервере');
   const job = createJob(currentUser(req), 'steam', link);
-  await runSteamJob(job, link);
+  try { await runSteamJob(job, link); }
+  finally { job.historyId = await saveHistory(job); }
   res.json(safeJob(job));
+}));
+
+const HISTORY_COLUMNS = 'id, user_id, username, kind, title, status, total, progress, result_rows, created_at';
+app.get('/api/history', auth, asyncRoute(async (req, res) => {
+  const result = await getPool().query(`SELECT ${HISTORY_COLUMNS} FROM check_history WHERE user_id = $1 ORDER BY id DESC LIMIT 300`, [req.user!.id]);
+  res.json(result.rows.map(row => historyView(row, false)));
+}));
+app.get('/api/admin/history', asyncRoute(async (_req, res) => {
+  const result = await getPool().query(`SELECT ${HISTORY_COLUMNS} FROM check_history ORDER BY id DESC LIMIT 500`);
+  res.json(result.rows.map(row => historyView(row, false)));
+}));
+app.get('/api/history/:id', auth, asyncRoute(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id <= 0) fail(400, 'Некорректный ID записи');
+  const result = await getPool().query(`SELECT ${HISTORY_COLUMNS}, event_logs FROM check_history WHERE id = $1`, [id]);
+  const row = result.rows[0];
+  if (!row || (Number(row.user_id) !== req.user!.id && req.user!.role !== 'admin')) fail(404, 'Запись не найдена');
+  res.json(historyView(row, true));
 }));
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'API endpoint not found' }));

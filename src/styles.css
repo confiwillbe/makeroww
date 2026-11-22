@@ -12,3 +12,15 @@
 .sidebar{grid-column:1;grid-row:1}
 .main-content{grid-column:2;grid-row:1}
 @media(max-width:850px){.app-frame{grid-template-columns:1fr}.sidebar,.main-content{grid-column:1}.mobile-scrim.show{display:block}}
+
+/* UID chip + check history */
+.uid-chip{display:inline-block;margin-left:8px;padding:2px 9px;border:1px solid #3a4540;border-radius:999px;font:9px 'DM Mono',monospace;letter-spacing:.8px;color:#a5b9ab;background:#1a211d;vertical-align:middle;white-space:nowrap}
+.history-toolbar{display:flex;gap:12px;align-items:center;padding:14px 17px;border-bottom:1px solid #242a2c}
+.history-toolbar .input-wrap{flex:1;max-width:360px}
+.history-row{cursor:pointer}
+.history-row.open td{background:#ffffff05}
+.history-open{color:#8fa597;font:8px 'DM Mono',monospace;letter-spacing:1px}
+.history-detail td{padding:0!important;white-space:normal!important;background:#0e1113}
+.history-detail .job-panel{margin:14px;max-width:none}
+.history-saved{display:flex;align-items:center;gap:6px;margin:12px 0 0;color:#8dc59d;font-size:10px}
+.muted-small{color:#6f7a7d;margin-left:6px}
