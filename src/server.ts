@@ -337,9 +337,9 @@ async function reserveLztSlot(): Promise<void> {
   const now = Date.now();
   const interval = LZT_INTERVAL_MS;
   const result = await getPool().query(
-    `INSERT INTO api_rate_limits (rate_key, next_request_at) VALUES ('lzt', $1 + $2)
+    `INSERT INTO api_rate_limits (rate_key, next_request_at) VALUES ('lzt', $1::BIGINT + $2::BIGINT)
      ON CONFLICT (rate_key) DO UPDATE
-     SET next_request_at = GREATEST(api_rate_limits.next_request_at, $1) + $2
+     SET next_request_at = GREATEST(api_rate_limits.next_request_at, $1::BIGINT) + $2::BIGINT
      RETURNING next_request_at`, [now, interval]
   );
   const scheduledAt = Number(result.rows[0]?.next_request_at ?? now + interval) - interval;
