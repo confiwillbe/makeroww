@@ -5,6 +5,7 @@ import { rateLimit } from 'express-rate-limit';
 import { Pool, neonConfig } from '@neondatabase/serverless';
 import argon2 from 'argon2';
 import { randomBytes, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
+import { Market } from 'lolzteam-api-ts';
 
 if (typeof WebSocket !== 'undefined') neonConfig.webSocketConstructor = WebSocket;
 
@@ -36,7 +37,6 @@ const COOKIE_SECURE = (process.env.COOKIE_SECURE ?? 'true').toLowerCase() !== 'f
 const COOKIE_NAME = 'makerow_session';
 const SESSION_SECONDS = 7 * 24 * 60 * 60;
 const STEAM_ID_BASE = 76561197960265728n;
-const LZT_URL = 'https://api.lzt.market/steam-value';
 const DISCORD_DEFAULT_CHANNEL = '1573865134806270074';
 const JOB_LOG_LIMIT = 120;
 const LZT_INTERVAL_MS = 3250;
@@ -44,6 +44,8 @@ const httpTimeoutMs = 45_000;
 
 let pool: Pool | undefined;
 let schemaPromise: Promise<void> | null = null;
+let lztMarketClient: Market | undefined;
+let lztMarketClientToken = '';
 
 function getPool(): Pool {
   const connectionString = (process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_URL_NON_POOLING || process.env.DATABASE_URL_UNPOOLED || '').trim();
@@ -342,34 +344,55 @@ function normalizeSteamLink(input: string): string {
   return `https://steamcommunity.com/${parts[0]}/${parts[1]}`;
 }
 function delay(ms: number): Promise<void> { return new Promise(resolveDelay => setTimeout(resolveDelay, ms)); }
+function getLztMarketClient(token: string): Market {
+  // Один SDK-клиент на инстанс. Межинстансовый лимит по-прежнему контролируется PostgreSQL ниже.
+  if (!lztMarketClient || lztMarketClientToken !== token) {
+    lztMarketClient = new Market({
+      token,
+      language: 'ru',
+      timeoutMs: httpTimeoutMs,
+      // Повторы и очередь запросов управляются существующим кодом приложения и PostgreSQL.
+      delayMs: 0,
+      maxRetries: 0,
+      retryStatuses: [],
+      warnOnRetry: false
+    });
+    lztMarketClientToken = token;
+  }
+  return lztMarketClient;
+}
 async function lztPriceRequest(profile: string): Promise<number> {
   const token = process.env.LZT_API_TOKEN || '';
   if (!token.trim()) throw new Error('На сервере не задан LZT_API_TOKEN');
   let response: Response;
-    try {
-      response = await fetch(LZT_URL + '?' + new URLSearchParams({ link: profile, app_id: '570', currency: 'usd' }), {
-        headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: AbortSignal.timeout(httpTimeoutMs)
-      });
-    } catch (error) { throw new Error(`LZT Market: ошибка соединения: ${error instanceof Error ? error.message : 'unknown error'}`); }
-    const body = await response.text();
-    if (response.status === 429) {
-      const headerValue = response.headers.get('retry-after');
-      const retry = headerValue && /^\d+$/.test(headerValue) ? Number(headerValue) : 10;
-      throw new Error(`RETRY_AFTER:${Math.min(180, Math.max(3, retry))}`);
-    }
-    if (response.status === 401) throw new Error('LZT Market: токен на сервере недействителен (HTTP 401)');
-    if (response.status === 403) {
-      if (isHiddenInventory(body)) throw new Error('HIDDEN: Инвентарь данного профиля скрыт');
-      throw new Error(`LZT Market: доступ к steam-value запрещён (HTTP 403): ${shortText(body)}`);
-    }
-    if (!response.ok) throw new Error(`LZT Market HTTP ${response.status}: ${shortText(body)}`);
-    let data: any;
-    try { data = JSON.parse(body); } catch { throw new Error(`LZT Market: неверный JSON: ${shortText(body)}`); }
-    if (data?.errors?.[0]) throw new Error(`LZT Market: ${String(data.errors[0])}`);
-    if (data?.error) throw new Error(`LZT Market: ${String(data.error)}`);
-    const total = extractTotal(data);
-    if (total === null) throw new Error(`LZT Market: не найдено поле общей стоимости. Ответ: ${shortText(body)}`);
-    return total;
+  try {
+    response = await getLztMarketClient(token).Managing_SteamValue({
+      link: profile,
+      appId: 570,
+      currency: 'usd'
+    });
+  } catch (error) {
+    throw new Error(`LZT Market: ошибка соединения: ${error instanceof Error ? error.message : 'unknown error'}`);
+  }
+  const body = await response.text();
+  if (response.status === 429) {
+    const headerValue = response.headers.get('retry-after');
+    const retry = headerValue && /^\d+$/.test(headerValue) ? Number(headerValue) : 10;
+    throw new Error(`RETRY_AFTER:${Math.min(180, Math.max(3, retry))}`);
+  }
+  if (response.status === 401) throw new Error('LZT Market: токен на сервере недействителен (HTTP 401)');
+  if (response.status === 403) {
+    if (isHiddenInventory(body)) throw new Error('HIDDEN: Инвентарь данного профиля скрыт');
+    throw new Error(`LZT Market: доступ к steam-value запрещён (HTTP 403): ${shortText(body)}`);
+  }
+  if (!response.ok) throw new Error(`LZT Market HTTP ${response.status}: ${shortText(body)}`);
+  let data: any;
+  try { data = JSON.parse(body); } catch { throw new Error(`LZT Market: неверный JSON: ${shortText(body)}`); }
+  if (data?.errors?.[0]) throw new Error(`LZT Market: ${String(data.errors[0])}`);
+  if (data?.error) throw new Error(`LZT Market: ${String(data.error)}`);
+  const total = extractTotal(data);
+  if (total === null) throw new Error(`LZT Market: не найдено поле общей стоимости. Ответ: ${shortText(body)}`);
+  return total;
 }
 async function reserveLztSlot(): Promise<void> {
   const now = Date.now();
