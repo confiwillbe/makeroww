@@ -9,7 +9,7 @@ import { Market } from 'lolzteam-api-ts';
 
 if (typeof WebSocket !== 'undefined') neonConfig.webSocketConstructor = WebSocket;
 
-type Role = 'admin' | 'user';
+type Role = 'admin' | 'moderator' | 'invite_manager' | 'user';
 interface AuthUser { id: number; username: string; role: Role; }
 interface PlayerRow { profile: string; price: number | null; status: string; }
 interface Job {
@@ -62,14 +62,21 @@ async function ensureDatabase(): Promise<void> {
       id BIGSERIAL PRIMARY KEY,
       username TEXT NOT NULL,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin','user')),
+      role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin','moderator','invite_manager','user')),
       active BOOLEAN NOT NULL DEFAULT TRUE,
       banned BOOLEAN NOT NULL DEFAULT FALSE,
       ban_reason TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await db.query('CREATE UNIQUE INDEX IF NOT EXISTS users_username_ci_uq ON users (LOWER(username))');
-    await db.query("CREATE UNIQUE INDEX IF NOT EXISTS users_one_admin_uq ON users (role) WHERE role = 'admin'");
+    // Upgrade existing installations atomically; the advisory lock avoids races between cold starts.
+    await db.query(`DO $$
+    BEGIN
+      PERFORM pg_advisory_xact_lock(734821906);
+      DROP INDEX IF EXISTS users_one_admin_uq;
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('admin','moderator','invite_manager','user'));
+    END $$`);
     await db.query(`CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY,
       user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -86,6 +93,12 @@ async function ensureDatabase(): Promise<void> {
       expires_at BIGINT NOT NULL,
       revoked_at BIGINT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+    await db.query(`CREATE TABLE IF NOT EXISTS invite_weekly_usage (
+      user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      week_start DATE NOT NULL,
+      generated_count INTEGER NOT NULL DEFAULT 0 CHECK (generated_count >= 0),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await db.query(`CREATE TABLE IF NOT EXISTS api_rate_limits (
       rate_key TEXT PRIMARY KEY,
@@ -219,9 +232,29 @@ const auth: RequestHandler = (req, res, next) => {
     next();
   })().catch(next);
 };
-function adminOnly(req: Request, res: ExpressResponse, next: NextFunction): void {
-  if (req.user?.role !== 'admin') { res.status(403).json({ error: 'Эта функция доступна только администраторам' }); return; }
-  next();
+function adminOrModerator(req: Request, res: ExpressResponse, next: NextFunction): void {
+  const role = req.user?.role;
+  if (role === 'admin') { next(); return; }
+  const moderatorCanReadUsers = req.method === 'GET' && req.path === '/users';
+  const moderatorCanActOnUsers = req.method === 'POST' && /^\/users\/\d+\/(ban|unban|toggle)$/.test(req.path);
+  if (role === 'moderator' && (moderatorCanReadUsers || moderatorCanActOnUsers)) { next(); return; }
+  res.status(403).json({ error: 'Недостаточно прав для этого действия' });
+}
+function inviteManagerOnly(req: Request, res: ExpressResponse, next: NextFunction): void {
+  if (req.user?.role === 'admin' || req.user?.role === 'invite_manager') { next(); return; }
+  res.status(403).json({ error: 'Генератор инвайтов доступен только администраторам и пользователям с соответствующей ролью' });
+}
+function utcWeekStart(): string {
+  const date = new Date();
+  const daysSinceMonday = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - daysSinceMonday);
+  date.setUTCHours(0, 0, 0, 0);
+  return date.toISOString().slice(0, 10);
+}
+function utcWeekResetAt(weekStart: string): number {
+  const nextMonday = new Date(`${weekStart}T00:00:00.000Z`);
+  nextMonday.setUTCDate(nextMonday.getUTCDate() + 7);
+  return Math.floor(nextMonday.getTime() / 1000);
 }
 function currentUser(req: Request): AuthUser {
   if (!req.user) fail(401, 'Войди в аккаунт');
@@ -586,10 +619,39 @@ app.post('/api/auth/logout', asyncRoute(async (req, res) => {
 }));
 app.get('/api/auth/me', auth, (req, res) => res.json({ id: req.user!.id, username: req.user!.username, role: req.user!.role }));
 
-app.use('/api/admin', auth, adminOnly);
+app.use('/api/admin', auth, adminOrModerator);
 app.get('/api/admin/users', auth, asyncRoute(async (_req, res) => {
   const result = await getPool().query('SELECT id, username, role, active, banned, ban_reason, created_at FROM users ORDER BY id ASC');
   res.json(result.rows.map(row => ({ ...row, id: Number(row.id), active: row.active ? 1 : 0, banned: row.banned ? 1 : 0 })));
+}));
+app.post('/api/admin/users/:id/role', auth, asyncRoute(async (req, res) => {
+  if (req.user!.role !== 'admin') fail(403, 'Назначать роли может только администратор');
+  const id = Number(req.params.id);
+  const role = String(req.body?.role || '') as Role;
+  const allowedRoles: Role[] = ['admin', 'moderator', 'invite_manager', 'user'];
+  if (!Number.isSafeInteger(id) || id <= 0) fail(400, 'Некорректный ID пользователя');
+  if (!allowedRoles.includes(role)) fail(400, 'Неизвестная роль');
+  if (id === req.user!.id) fail(400, 'Нельзя менять собственную роль из панели');
+
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    // Serialize role changes so two concurrent requests cannot demote the last administrator.
+    await client.query('SELECT pg_advisory_xact_lock(734821905)');
+    const target = await client.query('SELECT id, role FROM users WHERE id = $1 FOR UPDATE', [id]);
+    if (!target.rowCount) fail(404, 'Пользователь не найден');
+    const currentRole = String(target.rows[0].role) as Role;
+    if (currentRole === 'admin' && role !== 'admin') {
+      const count = await client.query("SELECT COUNT(*)::int AS count FROM users WHERE role = 'admin'");
+      if (Number(count.rows[0].count) <= 1) fail(400, 'Нельзя снять роль у последнего администратора');
+    }
+    await client.query('UPDATE users SET role = $1 WHERE id = $2', [role, id]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally { client.release(); }
+  res.json({ ok: true, role });
 }));
 app.post('/api/admin/invites', auth, asyncRoute(async (req, res) => {
   const maxUses = Math.max(1, Math.min(100, Number.parseInt(String(req.body?.max_uses ?? '1'), 10) || 1));
@@ -620,13 +682,14 @@ app.post('/api/admin/invites/:id/revoke', auth, asyncRoute(async (req, res) => {
 }));
 app.post('/api/admin/users/:id/ban', auth, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
-  if (!Number.isSafeInteger(id) || id === req.user!.id) fail(400, 'Нельзя заблокировать собственную учётную запись');
-  const reason = String(req.body?.reason || 'Заблокирован администратором').trim().slice(0, 240);
+  if (!Number.isSafeInteger(id) || id <= 0 || id === req.user!.id) fail(400, 'Нельзя заблокировать собственную учётную запись');
+  const reason = String(req.body?.reason || 'Заблокирован модерацией').trim().slice(0, 240);
+  const targetRoles = req.user!.role === 'admin' ? ['user', 'moderator', 'invite_manager'] : ['user', 'invite_manager'];
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');
-    const target = await client.query("UPDATE users SET banned = TRUE, ban_reason = $1 WHERE id = $2 AND role = 'user' RETURNING id", [reason, id]);
-    if (!target.rowCount) fail(404, 'Пользователь не найден или это администратор');
+    const target = await client.query('UPDATE users SET banned = TRUE, ban_reason = $1 WHERE id = $2 AND role = ANY($3::text[]) RETURNING id', [reason, id, targetRoles]);
+    if (!target.rowCount) fail(404, 'Пользователь не найден или его роль защищена');
     await client.query('DELETE FROM sessions WHERE user_id = $1', [id]);
     await client.query('COMMIT');
   } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
@@ -635,19 +698,21 @@ app.post('/api/admin/users/:id/ban', auth, asyncRoute(async (req, res) => {
 }));
 app.post('/api/admin/users/:id/unban', auth, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
-  const result = await getPool().query("UPDATE users SET banned = FALSE, ban_reason = NULL WHERE id = $1 AND role = 'user' AND banned = TRUE RETURNING id", [id]);
-  if (!result.rowCount) fail(404, 'Заблокированный пользователь не найден');
+  const targetRoles = req.user!.role === 'admin' ? ['user', 'moderator', 'invite_manager'] : ['user', 'invite_manager'];
+  const result = await getPool().query('UPDATE users SET banned = FALSE, ban_reason = NULL WHERE id = $1 AND role = ANY($2::text[]) AND banned = TRUE RETURNING id', [id, targetRoles]);
+  if (!result.rowCount) fail(404, 'Заблокированный пользователь не найден или его роль защищена');
   res.json({ ok: true, banned: false });
 }));
 app.post('/api/admin/users/:id/toggle', auth, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
-  if (!Number.isSafeInteger(id) || id === req.user!.id) fail(400, 'Нельзя отключить собственную учётную запись');
+  if (!Number.isSafeInteger(id) || id <= 0 || id === req.user!.id) fail(400, 'Нельзя отключить собственную учётную запись');
+  const targetRoles = req.user!.role === 'admin' ? ['user', 'moderator', 'invite_manager'] : ['user', 'invite_manager'];
   const client = await getPool().connect();
   let active: boolean;
   try {
     await client.query('BEGIN');
-    const row = await client.query("SELECT active FROM users WHERE id = $1 AND role = 'user' FOR UPDATE", [id]);
-    if (!row.rowCount) fail(404, 'Пользователь не найден или это администратор');
+    const row = await client.query('SELECT active FROM users WHERE id = $1 AND role = ANY($2::text[]) FOR UPDATE', [id, targetRoles]);
+    if (!row.rowCount) fail(404, 'Пользователь не найден или его роль защищена');
     active = !Boolean(row.rows[0].active);
     await client.query('UPDATE users SET active = $1 WHERE id = $2', [active, id]);
     if (!active) await client.query('DELETE FROM sessions WHERE user_id = $1', [id]);
@@ -658,13 +723,62 @@ app.post('/api/admin/users/:id/toggle', auth, asyncRoute(async (req, res) => {
 }));
 app.post('/api/admin/users/:id/reset-password', auth, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
-  const target = await getPool().query("SELECT id FROM users WHERE id = $1 AND role = 'user'", [id]);
+  const target = await getPool().query("SELECT id FROM users WHERE id = $1 AND role <> 'admin'", [id]);
   if (!target.rowCount) fail(404, 'Пользователь не найден или это администратор');
   const password = randomToken(12);
   const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
   await getPool().query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, id]);
   await getPool().query('DELETE FROM sessions WHERE user_id = $1', [id]);
   res.json({ ok: true, temporary_password: password });
+}));
+
+app.get('/api/member/invites', auth, inviteManagerOnly, asyncRoute(async (req, res) => {
+  const userId = req.user!.id;
+  const weekStart = utcWeekStart();
+  const [usageResult, inviteResult] = await Promise.all([
+    getPool().query('SELECT generated_count FROM invite_weekly_usage WHERE user_id = $1 AND week_start = $2', [userId, weekStart]),
+    getPool().query(`SELECT id, code_hint, max_uses, uses, expires_at, revoked_at, created_at
+      FROM invite_codes WHERE created_by = $1 AND created_at >= ($2::date::timestamp AT TIME ZONE 'UTC') ORDER BY id DESC LIMIT 20`, [userId, weekStart])
+  ]);
+  const used = Number(usageResult.rows[0]?.generated_count || 0);
+  const invites = inviteResult.rows.map((invite: any) => {
+    const row = { ...invite, id: Number(invite.id), expires_at: Number(invite.expires_at), revoked_at: invite.revoked_at === null ? null : Number(invite.revoked_at) };
+    return { ...row, status: row.revoked_at ? 'Отозван' : row.expires_at <= nowUnix() ? 'Истёк' : row.uses >= row.max_uses ? 'Использован' : 'Активен' };
+  });
+  res.json({ quota: { limit: 3, used, remaining: Math.max(0, 3 - used), week_start: weekStart, resets_at: utcWeekResetAt(weekStart) }, invites });
+}));
+app.post('/api/member/invites', auth, inviteManagerOnly, asyncRoute(async (req, res) => {
+  if (req.user!.role !== 'invite_manager') fail(400, 'Администраторы используют общий генератор инвайтов');
+  const userId = req.user!.id;
+  const weekStart = utcWeekStart();
+  const client = await getPool().connect();
+  const code = randomInviteCode();
+  const hint = `${code.slice(0, 7)}••••••••`;
+  const expiresAt = nowUnix() + 7 * 86400;
+  let id = 0;
+  let used = 0;
+  try {
+    await client.query('BEGIN');
+    const quota = await client.query(`INSERT INTO invite_weekly_usage (user_id, week_start, generated_count, updated_at)
+      VALUES ($1, $2, 1, NOW())
+      ON CONFLICT (user_id) DO UPDATE SET
+        week_start = EXCLUDED.week_start,
+        generated_count = CASE WHEN invite_weekly_usage.week_start = EXCLUDED.week_start
+          THEN invite_weekly_usage.generated_count + 1 ELSE 1 END,
+        updated_at = NOW()
+      RETURNING generated_count`, [userId, weekStart]);
+    used = Number(quota.rows[0].generated_count);
+    if (used > 3) fail(429, 'На этой неделе ты уже использовал все 3 инвайта. Лимит обновится в понедельник.');
+    const result = await client.query(`INSERT INTO invite_codes (code_hash, code_hint, created_by, max_uses, uses, expires_at)
+      VALUES ($1, $2, $3, 1, 0, $4) RETURNING id`, [sha256(code), hint, userId, expiresAt]);
+    id = Number(result.rows[0].id);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally { client.release(); }
+  res.status(201).json({ id, code, code_hint: hint, max_uses: 1, uses: 0, expires_at: expiresAt,
+    quota: { limit: 3, used, remaining: Math.max(0, 3 - used), week_start: weekStart, resets_at: utcWeekResetAt(weekStart) } });
 }));
 
 app.get('/api/settings/stratz', auth, asyncRoute(async (req, res) => {

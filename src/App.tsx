@@ -7,8 +7,9 @@ import {
   ShieldCheck, Skull, Sparkles, User, UserCheck, UserPlus, Users, Wallet, X, Zap, History as HistoryIcon
 } from 'lucide-react';
 
-type User = { id: number; username: string; role: 'admin' | 'user' };
-type Page = 'overview' | 'matches' | 'steam' | 'history' | 'settings' | 'admin';
+type Role = 'admin' | 'moderator' | 'invite_manager' | 'user';
+type User = { id: number; username: string; role: Role };
+type Page = 'overview' | 'matches' | 'steam' | 'history' | 'settings' | 'admin' | 'invites';
 type Job = {
   id: string; kind: 'match' | 'steam'; title: string; status: string; progress: number;
   total: number; rows: { profile: string; price: number | null; status: string }[]; logs: string[]; done: boolean; historyId?: number;
@@ -19,13 +20,14 @@ type HistoryItem = {
   logs?: string[]; created_at: string;
 };
 type AdminUser = {
-  id: number; username: string; role: string; active: number; banned: number;
+  id: number; username: string; role: Role; active: number; banned: number;
   ban_reason: string | null; created_at: string;
 };
 type Invite = {
   id: number; code_hint: string; max_uses: number; uses: number; expires_at: number;
-  revoked_at: number | null; created_at: string; created_by: string; status: string;
+  revoked_at: number | null; created_at: string; created_by?: string; status: string;
 };
+type WeeklyInviteQuota = { limit: number; used: number; remaining: number; week_start: string; resets_at: number };
 
 const api = async <T,>(path: string, options: RequestInit = {}): Promise<T> => {
   const response = await fetch(path, {
@@ -40,6 +42,7 @@ const api = async <T,>(path: string, options: RequestInit = {}): Promise<T> => {
 
 function money(value: number | null): string { return value === null ? '—' : `$${value.toFixed(2)}`; }
 function uidLabel(id: number): string { return `UID ${String(id).padStart(5, '0')}`; }
+function roleLabel(role: Role): string { return ({ admin: 'Администратор', moderator: 'Модератор', invite_manager: 'Генератор инвайтов', user: 'Участник' })[role]; }
 function dateTimeLabel(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
@@ -60,6 +63,8 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string; kind: 'ok' | 'error' } | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
+  const [memberInvites, setMemberInvites] = useState<Invite[]>([]);
+  const [weeklyInviteQuota, setWeeklyInviteQuota] = useState<WeeklyInviteQuota | null>(null);
   const [adminTab, setAdminTab] = useState<'users' | 'invites'>('invites');
   const [newInvite, setNewInvite] = useState<{ code: string; uses: number; expires: number } | null>(null);
   const [inviteUses, setInviteUses] = useState('1');
@@ -95,15 +100,24 @@ export default function App() {
 
   useEffect(() => { void loadMe(); }, [loadMe]);
   useEffect(() => {
-    if (user?.role === 'admin') void loadAdminData();
+    if (user?.role === 'admin' || user?.role === 'moderator') void loadAdminData();
+    if (user?.role === 'invite_manager') void loadMemberInviteData();
   }, [user]);
 
   async function loadAdminData() {
+    if (!user || (user.role !== 'admin' && user.role !== 'moderator')) return;
     try {
-      const [userRows, inviteRows] = await Promise.all([
-        api<AdminUser[]>('/api/admin/users'), api<Invite[]>('/api/admin/invites')
-      ]);
-      setUsers(userRows); setInvites(inviteRows);
+      const userRows = await api<AdminUser[]>('/api/admin/users');
+      setUsers(userRows);
+      if (user.role === 'admin') setInvites(await api<Invite[]>('/api/admin/invites'));
+      else setInvites([]);
+    } catch (error) { notify((error as Error).message, 'error'); }
+  }
+
+  async function loadMemberInviteData() {
+    try {
+      const result = await api<{ quota: WeeklyInviteQuota; invites: Invite[] }>('/api/member/invites');
+      setWeeklyInviteQuota(result.quota); setMemberInvites(result.invites);
     } catch (error) { notify((error as Error).message, 'error'); }
   }
 
@@ -125,7 +139,7 @@ export default function App() {
 
   async function logout() {
     try { await api('/api/auth/logout', { method: 'POST' }); } catch { /* cookie may already be expired */ }
-    setUser(null); setAuthMode('login'); setPage('overview'); setMatchJob(null); setSteamJob(null); setNewInvite(null); setCredential(null); setHistory([]); setHistoryScope('mine');
+    setUser(null); setAuthMode('login'); setPage('overview'); setMatchJob(null); setSteamJob(null); setNewInvite(null); setCredential(null); setHistory([]); setHistoryScope('mine'); setMemberInvites([]); setWeeklyInviteQuota(null);
   }
 
   async function startMatch(event: FormEvent<HTMLFormElement>) {
@@ -156,6 +170,18 @@ export default function App() {
       });
       setNewInvite({ code: result.code, uses: result.max_uses, expires: result.expires_at });
       notify('Инвайт создан. Скопируй ключ — повторно он не показывается.'); await loadAdminData();
+    } catch (error) { notify((error as Error).message, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  async function createMemberInvite() {
+    setBusy(true); setNewInvite(null);
+    try {
+      const result = await api<{ id: number; code: string; max_uses: number; expires_at: number; quota: WeeklyInviteQuota }>('/api/member/invites', { method: 'POST' });
+      setNewInvite({ code: result.code, uses: result.max_uses, expires: result.expires_at });
+      setWeeklyInviteQuota(result.quota);
+      notify('Инвайт создан. Он действует 7 дней и подходит для одной регистрации.');
+      await loadMemberInviteData();
     } catch (error) { notify((error as Error).message, 'error'); }
     finally { setBusy(false); }
   }
@@ -194,14 +220,26 @@ export default function App() {
     } catch (error) { notify((error as Error).message, 'error'); }
   }
 
-  const pageTitle = useMemo(() => ({ overview: 'Обзор', matches: 'Проверка матчей', steam: 'Проверка Steam-профиля', history: 'История проверок', settings: 'Мои API-ключи', admin: 'Управление доступом' }[page]), [page]);
-  const navigate = (target: Page) => { setPage(target); setMobileOpen(false); if (target === 'admin') void loadAdminData(); if (target === 'history') void loadHistory(historyScope); };
+  async function changeUserRole(target: AdminUser, role: Role) {
+    if (!window.confirm(`Изменить роль ${target.username} на «${roleLabel(role)}»?`)) return;
+    try {
+      await api(`/api/admin/users/${target.id}/role`, { method: 'POST', body: JSON.stringify({ role }) });
+      notify(`Роль пользователя ${target.username} обновлена. Новые права появятся после обновления страницы.`);
+      await loadAdminData();
+    } catch (error) { notify((error as Error).message, 'error'); }
+  }
+
+  const pageTitle = useMemo(() => ({ overview: 'Обзор', matches: 'Проверка матчей', steam: 'Проверка Steam-профиля', history: 'История проверок', settings: 'Мои API-ключи', admin: user?.role === 'moderator' ? 'Модерация' : 'Управление доступом', invites: 'Генератор инвайтов' }[page]), [page, user?.role]);
+  const navigate = (target: Page) => { setPage(target); setMobileOpen(false); if (target === 'admin') { if (user?.role === 'moderator') setAdminTab('users'); void loadAdminData(); } if (target === 'invites') void loadMemberInviteData(); if (target === 'history') void loadHistory(historyScope); };
 
   if (loadingAuth) return <div className="boot-screen"><div className="boot-mark"><img src="/assets/makerow-dog.png"/><span /></div><p>MAKEROW TEAMWORK</p><small>Подключаем защищённую панель…</small></div>;
 
   if (!user) return <AuthScreen mode={authMode} setMode={setAuthMode} onSubmit={submitAuth} busy={busy} toast={toast} />;
 
   const isAdmin = user.role === 'admin';
+  const isModerator = user.role === 'moderator';
+  const isInviteManager = user.role === 'invite_manager';
+  const canModerate = isAdmin || isModerator;
   return (
     <div className="app-frame">
       <div className={`mobile-scrim ${mobileOpen ? 'show' : ''}`} onClick={() => setMobileOpen(false)} />
@@ -220,16 +258,20 @@ export default function App() {
           <NavButton active={page === 'history'} icon={<HistoryIcon size={17}/>} label="История проверок" onClick={() => navigate('history')}/>
           <NavButton active={page === 'settings'} icon={<KeyRound size={17}/>} label="Мои API-ключи" onClick={() => navigate('settings')}/>
         </nav>
-        {isAdmin && <>
-          <div className="nav-label admin-label">АДМИНИСТРИРОВАНИЕ</div>
-          <nav className="side-nav"><NavButton active={page === 'admin'} icon={<Shield size={17}/>} label="Пользователи и инвайты" onClick={() => navigate('admin')} badge="ADMIN"/></nav>
+        {canModerate && <>
+          <div className="nav-label admin-label">{isAdmin ? 'АДМИНИСТРИРОВАНИЕ' : 'МОДЕРАЦИЯ'}</div>
+          <nav className="side-nav"><NavButton active={page === 'admin'} icon={<Shield size={17}/>} label={isAdmin ? 'Панель управления' : 'Модерация участников'} onClick={() => navigate('admin')} badge={isAdmin ? 'ADMIN' : 'MOD'}/></nav>
+        </>}
+        {isInviteManager && <>
+          <div className="nav-label admin-label">ДОСТУПЫ</div>
+          <nav className="side-nav"><NavButton active={page === 'invites'} icon={<KeyRound size={17}/>} label="Генератор инвайтов" onClick={() => navigate('invites')} badge="3 / НЕД."/></nav>
         </>}
         <div className="sidebar-bottom">
           <div className="system-status"><span className="pulse-dot"/><span>Система активна</span><span className="status-right">LIVE</span></div>
           <div className="profile-mini">
             <div className="profile-avatar">{user.username.slice(0, 1).toUpperCase()}</div>
-            <div className="profile-meta"><strong>{user.username}</strong><span>{uidLabel(user.id)} · {isAdmin ? 'Админ' : 'Участник'}</span></div>
-            {isAdmin && <Crown size={14} className="crown-icon"/>}
+            <div className="profile-meta"><strong>{user.username}</strong><span>{uidLabel(user.id)} · {roleLabel(user.role)}</span></div>
+            {isAdmin && <Crown size={14} className="crown-icon"/>}{isModerator && <Shield size={14} className="crown-icon"/>}{isInviteManager && <KeyRound size={14} className="crown-icon"/>}
             <button className="icon-button logout-mini" title="Выйти" onClick={logout}><LogOut size={16}/></button>
           </div>
         </div>
@@ -246,13 +288,15 @@ export default function App() {
         {page === 'steam' && <Steam link={steamLink} setLink={setSteamLink} busy={busy} job={steamJob} onSubmit={startSteam}/>} 
         {page === 'history' && <HistoryPage items={history} isAdmin={isAdmin} scope={historyScope} setScope={(scope) => { setHistoryScope(scope); void loadHistory(scope); }} refresh={() => loadHistory(historyScope)} />}
         {page === 'settings' && <ApiKeysPage notify={notify} />}
-        {page === 'admin' && isAdmin && <AdminPanel
+        {page === 'admin' && canModerate && <AdminPanel
+          mode={isAdmin ? 'admin' : 'moderator'} currentUserId={user.id}
           tab={adminTab} setTab={setAdminTab} users={users} invites={invites} busy={busy}
           uses={inviteUses} setUses={setInviteUses} days={inviteDays} setDays={setInviteDays}
           newInvite={newInvite} setNewInvite={setNewInvite} credential={credential} setCredential={setCredential}
           createInvite={createInvite} revokeInvite={revokeInvite} banUser={banUser} unbanUser={unbanUser}
-          toggleUser={toggleUser} resetPassword={resetPassword} refresh={loadAdminData}
+          toggleUser={toggleUser} resetPassword={resetPassword} changeUserRole={changeUserRole} refresh={loadAdminData}
         />}
+        {page === 'invites' && isInviteManager && <InviteManagerPanel quota={weeklyInviteQuota} invites={memberInvites} newInvite={newInvite} setNewInvite={setNewInvite} busy={busy} createInvite={createMemberInvite} refresh={loadMemberInviteData}/>}
         <footer className="page-footer"><span>MAKEROW TEAMWORK <i>© {new Date().getFullYear()}</i></span><span>STRATZ <b>·</b> LZT MARKET <b>·</b> PRIVATE ACCESS</span></footer>
       </main>
       {toast && <div className={`toast ${toast.kind}`}><span className="toast-icon">{toast.kind === 'ok' ? <CheckCircle2 size={17}/> : <CircleHelp size={17}/>}</span>{toast.message}<button onClick={() => setToast(null)}><X size={15}/></button></div>}
@@ -430,30 +474,67 @@ function HistoryPage({ items, isAdmin, scope, setScope, refresh }: { items: Hist
     </section>
   </div>;
 }
-function AdminPanel({ tab, setTab, users, invites, busy, uses, setUses, days, setDays, newInvite, setNewInvite, credential, setCredential, createInvite, revokeInvite, banUser, unbanUser, toggleUser, resetPassword, refresh }: {
+function AdminPanel({ mode, currentUserId, tab, setTab, users, invites, busy, uses, setUses, days, setDays, newInvite, setNewInvite, credential, setCredential, createInvite, revokeInvite, banUser, unbanUser, toggleUser, resetPassword, changeUserRole, refresh }: {
+  mode: 'admin' | 'moderator'; currentUserId: number;
   tab: 'users' | 'invites'; setTab: (tab: 'users' | 'invites') => void; users: AdminUser[]; invites: Invite[]; busy: boolean;
   uses: string; setUses: (v: string) => void; days: string; setDays: (v: string) => void;
   newInvite: { code: string; uses: number; expires: number } | null; setNewInvite: (v: { code: string; uses: number; expires: number } | null) => void;
   credential: string | null; setCredential: (v: string | null) => void; createInvite: (event: FormEvent<HTMLFormElement>) => void;
   revokeInvite: (id: number) => void; banUser: (user: AdminUser) => void; unbanUser: (user: AdminUser) => void;
-  toggleUser: (user: AdminUser) => void; resetPassword: (user: AdminUser) => void; refresh: () => void;
+  toggleUser: (user: AdminUser) => void; resetPassword: (user: AdminUser) => void;
+  changeUserRole: (user: AdminUser, role: Role) => void; refresh: () => void;
 }) {
-  return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">ADMIN CONTROL CENTER <span className="tiny-status">● ROOT ACCESS</span></div><h2>Управление <em>командой</em></h2><p>Выдавай доступы по инвайтам, отслеживай аккаунты и управляй блокировками пользователей.</p></div><div className="admin-seal"><Crown size={20}/><span>ADMIN<br/>ONLY</span></div></div>
-    <div className="admin-summary"><div><span>ПОЛЬЗОВАТЕЛИ</span><b>{users.filter(u => u.role === 'user').length.toString().padStart(2, '0')}</b></div><div><span>АКТИВНЫЕ ИНВАЙТЫ</span><b>{invites.filter(i => i.status === 'Активен').length.toString().padStart(2, '0')}</b></div><div><span>ЗАБЛОКИРОВАНО</span><b>{users.filter(u => u.banned).length.toString().padStart(2, '0')}</b></div><div><span>ВСЕГО ИНВАЙТОВ</span><b>{invites.length.toString().padStart(2, '0')}</b></div></div>
-    <div className="admin-tabs"><button className={tab === 'invites' ? 'active' : ''} onClick={() => setTab('invites')}><KeyRound size={16}/> Инвайт-ключи <span>{invites.length}</span></button><button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}><Users size={16}/> Пользователи <span>{users.length}</span></button><button className="refresh-admin" onClick={refresh}><RefreshCw size={15}/> Обновить</button></div>
-    {tab === 'invites' ? <div className="admin-content-grid"><section className="surface-card invite-create-card"><div className="card-overline"><span>INVITE GENERATOR</span><span className="tag">ADMIN ONLY</span></div><div className="big-card-icon"><KeyRound size={20}/></div><h3>Создать инвайт</h3><p className="muted-copy">Ключ можно передать другу. При регистрации он обязательно укажет этот ключ. Секретная часть показывается только один раз.</p><form onSubmit={createInvite} className="invite-form"><label className="field-label">КОЛИЧЕСТВО РЕГИСТРАЦИЙ<select value={uses} onChange={e => setUses(e.target.value)}><option value="1">1 использование</option><option value="3">3 использования</option><option value="5">5 использований</option><option value="10">10 использований</option><option value="25">25 использований</option><option value="100">100 использований</option></select></label><label className="field-label">СРОК ДЕЙСТВИЯ<select value={days} onChange={e => setDays(e.target.value)}><option value="1">1 день</option><option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option><option value="90">90 дней</option><option value="365">365 дней</option></select></label><button className="button button-primary" disabled={busy}><Plus size={17}/> Сгенерировать ключ</button></form>
+  const isAdmin = mode === 'admin';
+  return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">{isAdmin ? 'ADMIN CONTROL CENTER' : 'TEAM MODERATION'} <span className="tiny-status">● {isAdmin ? 'ROOT ACCESS' : 'MODERATOR ACCESS'}</span></div><h2>{isAdmin ? <>Управление <em>командой</em></> : <>Модерация <em>участников</em></>}</h2><p>{isAdmin ? 'Выдавай роли, управляй инвайтами, отслеживай аккаунты и блокировки.' : 'Просматривай участников, блокируй нарушителей и управляй доступом. Назначать роли может только администратор.'}</p></div><div className="admin-seal">{isAdmin ? <Crown size={20}/> : <Shield size={20}/>}<span>{isAdmin ? <>ADMIN<br/>ONLY</> : <>MOD<br/>ONLY</>}</span></div></div>
+    <div className="admin-summary"><div><span>УЧАСТНИКИ</span><b>{users.filter(u => u.role === 'user').length.toString().padStart(2, '0')}</b></div><div><span>МОДЕРАТОРЫ</span><b>{users.filter(u => u.role === 'moderator').length.toString().padStart(2, '0')}</b></div><div><span>ГЕНЕРАТОРЫ</span><b>{users.filter(u => u.role === 'invite_manager').length.toString().padStart(2, '0')}</b></div><div><span>ЗАБЛОКИРОВАНО</span><b>{users.filter(u => u.banned).length.toString().padStart(2, '0')}</b></div></div>
+    <div className="admin-tabs">{isAdmin && <button className={tab === 'invites' ? 'active' : ''} onClick={() => setTab('invites')}><KeyRound size={16}/> Инвайт-ключи <span>{invites.length}</span></button>}<button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}><Users size={16}/> Пользователи <span>{users.length}</span></button><button className="refresh-admin" onClick={refresh}><RefreshCw size={15}/> Обновить</button></div>
+    {isAdmin && tab === 'invites' ? <div className="admin-content-grid"><section className="surface-card invite-create-card"><div className="card-overline"><span>INVITE GENERATOR</span><span className="tag">ADMIN ONLY</span></div><div className="big-card-icon"><KeyRound size={20}/></div><h3>Создать инвайт</h3><p className="muted-copy">Ключ можно передать другу. При регистрации он обязательно укажет этот ключ. Секретная часть показывается только один раз.</p><form onSubmit={createInvite} className="invite-form"><label className="field-label">КОЛИЧЕСТВО РЕГИСТРАЦИЙ<select value={uses} onChange={e => setUses(e.target.value)}><option value="1">1 использование</option><option value="3">3 использования</option><option value="5">5 использований</option><option value="10">10 использований</option><option value="25">25 использований</option><option value="100">100 использований</option></select></label><label className="field-label">СРОК ДЕЙСТВИЯ<select value={days} onChange={e => setDays(e.target.value)}><option value="1">1 день</option><option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option><option value="90">90 дней</option><option value="365">365 дней</option></select></label><button className="button button-primary" disabled={busy}><Plus size={17}/> Сгенерировать ключ</button></form>
       {newInvite && <div className="generated-invite"><div className="generated-invite-top"><span><CheckCircle2 size={15}/> ИНВАЙТ СОЗДАН</span><button onClick={() => setNewInvite(null)}><X size={14}/></button></div><strong>{newInvite.code}</strong><div className="generated-meta"><span>{newInvite.uses} регистраций</span><span>до {dateLabel(newInvite.expires)}</span></div><button className="copy-key" onClick={() => { void navigator.clipboard.writeText(newInvite.code); }}><Copy size={15}/> Скопировать инвайт</button></div>}
     </section><section className="surface-card invite-how-card"><div className="card-overline"><span>ACCESS CONTROL</span><span className="tag muted-tag">HOW IT WORKS</span></div><h3>Как работают инвайты</h3><PipelineStep no="01" title="Администратор создаёт ключ" text="Выбирает количество регистраций и срок действия."/><PipelineStep no="02" title="Пользователь регистрируется" text="Вводит инвайт, логин и свой пароль. Без действующего ключа регистрация невозможна."/><PipelineStep no="03" title="Ключ становится недоступен" text="После заданного числа регистраций или окончания срока ключ перестаёт работать." last/><div className="aside-foot"><Shield size={15}/> Инвайты хранятся в базе в виде хеша — исходный ключ повторно не раскрывается.</div></section>
       <section className="surface-card full-width table-card"><div className="table-heading"><div><span className="eyebrow">ISSUED KEYS</span><h3>Список инвайтов</h3></div><span className="table-count">{invites.length} ЗАПИСЕЙ</span></div><InviteTable invites={invites} revoke={revokeInvite}/></section></div>
-    : <section className="surface-card table-card"><div className="table-heading"><div><span className="eyebrow">MEMBER MANAGEMENT</span><h3>Участники команды</h3><p>Администраторов нельзя заблокировать из этой панели.</p></div><span className="table-count">{users.length} АККАУНТОВ</span></div>{credential && <div className="credential-reveal"><div><CheckCircle2 size={17}/><span>НОВЫЙ ПАРОЛЬ СОЗДАН — СОХРАНИ ЕГО СЕЙЧАС</span></div><code>{credential}</code><button onClick={() => { void navigator.clipboard.writeText(credential); }}><Copy size={14}/> Скопировать</button><button className="credential-close" onClick={() => setCredential(null)}><X size={14}/></button></div>}<UsersTable users={users} ban={banUser} unban={unbanUser} toggle={toggleUser} reset={resetPassword}/></section>}
+    : <section className="surface-card table-card"><div className="table-heading"><div><span className="eyebrow">{isAdmin ? 'MEMBER & ROLE MANAGEMENT' : 'MEMBER MODERATION'}</span><h3>{isAdmin ? 'Участники команды и роли' : 'Участники команды'}</h3><p>{isAdmin ? 'Меняй роль пользователя. Последнего администратора нельзя понизить.' : 'Модераторы могут управлять обычными участниками и генераторами инвайтов, но не другими модераторами и администраторами.'}</p></div><span className="table-count">{users.length} АККАУНТОВ</span></div>{credential && <div className="credential-reveal"><div><CheckCircle2 size={17}/><span>НОВЫЙ ПАРОЛЬ СОЗДАН — СОХРАНИ ЕГО СЕЙЧАС</span></div><code>{credential}</code><button onClick={() => { void navigator.clipboard.writeText(credential); }}><Copy size={14}/> Скопировать</button><button className="credential-close" onClick={() => setCredential(null)}><X size={14}/></button></div>}<UsersTable users={users} currentUserId={currentUserId} canManageRoles={isAdmin} canResetPassword={isAdmin} ban={banUser} unban={unbanUser} toggle={toggleUser} reset={resetPassword} changeRole={changeUserRole}/></section>}
   </div>;
 }
-function InviteTable({ invites, revoke }: { invites: Invite[]; revoke: (id: number) => void }) {
-  if (!invites.length) return <div className="empty-table"><KeyRound size={24}/><b>Инвайтов пока нет</b><span>Создай первый ключ, чтобы пригласить участников команды.</span></div>;
-  return <div className="table-scroll"><table className="data-table"><thead><tr><th>КЛЮЧ</th><th>ИСПОЛЬЗОВАНИЯ</th><th>СОЗДАН</th><th>ИСТЕКАЕТ</th><th>СТАТУС</th><th/></tr></thead><tbody>{invites.map(invite => <tr key={invite.id}><td><span className="code-cell"><KeyRound size={14}/>{invite.code_hint}</span></td><td>{invite.uses} / {invite.max_uses}</td><td>{dateLabel(invite.created_at)}</td><td>{dateLabel(invite.expires_at)}</td><td><StatusBadge status={invite.status}/></td><td>{invite.status === 'Активен' && <button className="table-action danger" onClick={() => revoke(invite.id)}><Ban size={14}/> Отозвать</button>}</td></tr>)}</tbody></table></div>;
+
+function InviteManagerPanel({ quota, invites, newInvite, setNewInvite, busy, createInvite, refresh }: {
+  quota: WeeklyInviteQuota | null; invites: Invite[]; newInvite: { code: string; uses: number; expires: number } | null;
+  setNewInvite: (value: { code: string; uses: number; expires: number } | null) => void;
+  busy: boolean; createInvite: () => void; refresh: () => void;
+}) {
+  const remaining = quota?.remaining ?? 0;
+  return <div className="page-stack"><div className="page-intro"><div><div className="eyebrow">PERSONAL INVITE ACCESS <span className="tiny-status">● ACTIVE ROLE</span></div><h2>Генератор <em>инвайтов</em></h2><p>Твоя роль позволяет выпускать до трёх одноразовых инвайтов в неделю.</p></div><div className="admin-seal"><KeyRound size={20}/><span>3 /<br/>WEEK</span></div></div>
+    <div className="weekly-quota-card surface-card"><div><span className="eyebrow">НЕДЕЛЬНЫЙ ЛИМИТ</span><h3>{quota ? `${quota.used} из ${quota.limit}` : 'Загрузка…'} <small>инвайтов использовано</small></h3><p>{quota ? `Осталось ${quota.remaining}. Лимит обновится ${dateLabel(quota.resets_at)} (UTC).` : 'Проверяем доступный лимит.'}</p></div><div className="quota-dots">{[0, 1, 2].map(index => <span key={index} className={index < (quota?.used || 0) ? 'used' : ''}/>)}</div></div>
+    <div className="admin-content-grid"><section className="surface-card invite-create-card"><div className="card-overline"><span>WEEKLY INVITE GENERATOR</span><span className="tag">{remaining} ОСТАЛОСЬ</span></div><div className="big-card-icon"><KeyRound size={20}/></div><h3>Создать инвайт</h3><p className="muted-copy">Каждый ключ можно использовать один раз. Он действует 7 дней. Секретный ключ показывается только после создания — сразу скопируй его.</p><button className="button button-primary" disabled={busy || !quota || remaining <= 0} onClick={createInvite}><Plus size={17}/> Сгенерировать инвайт</button>
+      {newInvite && <div className="generated-invite"><div className="generated-invite-top"><span><CheckCircle2 size={15}/> ИНВАЙТ СОЗДАН</span><button onClick={() => setNewInvite(null)}><X size={14}/></button></div><strong>{newInvite.code}</strong><div className="generated-meta"><span>1 регистрация</span><span>до {dateLabel(newInvite.expires)}</span></div><button className="copy-key" onClick={() => { void navigator.clipboard.writeText(newInvite.code); }}><Copy size={15}/> Скопировать инвайт</button></div>}
+    </section><section className="surface-card invite-how-card"><div className="card-overline"><span>YOUR PERMISSIONS</span><span className="tag muted-tag">WEEKLY LIMIT</span></div><h3>Правила роли</h3><PipelineStep no="01" title="Три инвайта в неделю" text="Лимит общий для твоего аккаунта и обновляется каждый понедельник в 00:00 UTC."/><PipelineStep no="02" title="Одна регистрация" text="Каждый созданный ключ подходит только для одного нового аккаунта."/><PipelineStep no="03" title="Срок — 7 дней" text="Если ключ не использован за 7 дней, он автоматически перестаёт работать." last/><div className="aside-foot"><Shield size={15}/> Лимит проверяется на сервере и хранится в базе данных.</div></section>
+      <section className="surface-card full-width table-card"><div className="table-heading"><div><span className="eyebrow">YOUR ISSUED KEYS</span><h3>Созданные на этой неделе инвайты</h3></div><button className="table-action" onClick={refresh}><RefreshCw size={14}/> Обновить</button></div><InviteTable invites={invites} revoke={() => undefined} allowRevoke={false}/></section></div>
+  </div>;
 }
-function UsersTable({ users, ban, unban, toggle, reset }: { users: AdminUser[]; ban: (u: AdminUser) => void; unban: (u: AdminUser) => void; toggle: (u: AdminUser) => void; reset: (u: AdminUser) => void }) {
-  return <div className="table-scroll"><table className="data-table users-data"><thead><tr><th>УЧАСТНИК</th><th>РОЛЬ</th><th>СОСТОЯНИЕ</th><th>РЕГИСТРАЦИЯ</th><th>УПРАВЛЕНИЕ</th></tr></thead><tbody>{users.map(target => <tr key={target.id}><td><div className="user-cell"><div className="user-table-avatar">{target.username[0]?.toUpperCase()}</div><div><b>{target.username}</b><small>UID {String(target.id).padStart(5, '0')}</small></div></div></td><td>{target.role === 'admin' ? <span className="role-admin"><Crown size={13}/> Admin</span> : 'Member'}</td><td><StatusBadge status={target.banned ? 'Заблокирован' : target.active ? 'Активен' : 'Отключён'}/>{target.ban_reason && target.banned && <small className="ban-reason">{target.ban_reason}</small>}</td><td>{dateLabel(target.created_at)}</td><td>{target.role === 'admin' ? <span className="protected-label"><Shield size={13}/> Защищён</span> : <div className="user-actions">{target.banned ? <button className="table-action success" onClick={() => unban(target)}><UserCheck size={14}/> Разбанить</button> : <button className="table-action danger" onClick={() => ban(target)}><Ban size={14}/> Бан</button>}<button className="table-action" onClick={() => toggle(target)}>{target.active ? 'Отключить' : 'Включить'}</button><button className="table-action" onClick={() => reset(target)} title="Сбросить пароль"><RefreshCw size={14}/></button></div>}</td></tr>)}</tbody></table></div>;
+
+function InviteTable({ invites, revoke, allowRevoke = true }: { invites: Invite[]; revoke: (id: number) => void; allowRevoke?: boolean }) {
+  if (!invites.length) return <div className="empty-table"><KeyRound size={24}/><b>Инвайтов пока нет</b><span>Создай первый ключ, чтобы пригласить участников команды.</span></div>;
+  return <div className="table-scroll"><table className="data-table"><thead><tr><th>КЛЮЧ</th><th>ИСПОЛЬЗОВАНИЯ</th><th>СОЗДАН</th><th>ИСТЕКАЕТ</th><th>СТАТУС</th>{allowRevoke && <th/>}</tr></thead><tbody>{invites.map(invite => <tr key={invite.id}><td><span className="code-cell"><KeyRound size={14}/>{invite.code_hint}</span></td><td>{invite.uses} / {invite.max_uses}</td><td>{dateLabel(invite.created_at)}</td><td>{dateLabel(invite.expires_at)}</td><td><StatusBadge status={invite.status}/></td>{allowRevoke && <td>{invite.status === 'Активен' && <button className="table-action danger" onClick={() => revoke(invite.id)}><Ban size={14}/> Отозвать</button>}</td>}</tr>)}</tbody></table></div>;
+}
+function UsersTable({ users, currentUserId, canManageRoles, canResetPassword, ban, unban, toggle, reset, changeRole }: {
+  users: AdminUser[]; currentUserId: number; canManageRoles: boolean; canResetPassword: boolean;
+  ban: (u: AdminUser) => void; unban: (u: AdminUser) => void; toggle: (u: AdminUser) => void;
+  reset: (u: AdminUser) => void; changeRole: (u: AdminUser, role: Role) => void;
+}) {
+  return <div className="table-scroll"><table className="data-table users-data"><thead><tr><th>УЧАСТНИК</th><th>РОЛЬ</th><th>СОСТОЯНИЕ</th><th>РЕГИСТРАЦИЯ</th><th>УПРАВЛЕНИЕ</th></tr></thead><tbody>{users.map(target => {
+    const protectedFromModerator = !canManageRoles && (target.role === 'admin' || target.role === 'moderator');
+    const canModerateTarget = target.id !== currentUserId && !protectedFromModerator && target.role !== 'admin';
+    return <tr key={target.id}><td><div className="user-cell"><div className="user-table-avatar">{target.username[0]?.toUpperCase()}</div><div><b>{target.username}</b><small>UID {String(target.id).padStart(5, '0')}</small></div></div></td>
+      <td>{canManageRoles && target.id !== currentUserId ? <select className="role-select" value={target.role} onChange={event => changeRole(target, event.target.value as Role)} aria-label={`Роль пользователя ${target.username}`}><option value="user">Участник</option><option value="invite_manager">Генератор инвайтов</option><option value="moderator">Модератор</option><option value="admin">Администратор</option></select> : <RoleBadge role={target.role}/>}</td>
+      <td><StatusBadge status={target.banned ? 'Заблокирован' : target.active ? 'Активен' : 'Отключён'}/>{target.ban_reason && target.banned && <small className="ban-reason">{target.ban_reason}</small>}</td><td>{dateLabel(target.created_at)}</td>
+      <td>{target.id === currentUserId ? <span className="protected-label"><Shield size={13}/> Ваш аккаунт</span> : !canModerateTarget ? <span className="protected-label"><Shield size={13}/> Защищён</span> : <div className="user-actions">{target.banned ? <button className="table-action success" onClick={() => unban(target)}><UserCheck size={14}/> Разбанить</button> : <button className="table-action danger" onClick={() => ban(target)}><Ban size={14}/> Бан</button>}<button className="table-action" onClick={() => toggle(target)}>{target.active ? 'Отключить' : 'Включить'}</button>{canResetPassword && <button className="table-action" onClick={() => reset(target)} title="Сбросить пароль"><RefreshCw size={14}/></button>}</div>}</td>
+    </tr>;
+  })}</tbody></table></div>;
+}
+function RoleBadge({ role }: { role: Role }) {
+  if (role === 'admin') return <span className="role-admin"><Crown size={13}/> Администратор</span>;
+  if (role === 'moderator') return <span className="role-moderator"><Shield size={13}/> Модератор</span>;
+  if (role === 'invite_manager') return <span className="role-invites"><KeyRound size={13}/> Инвайты · 3/нед.</span>;
+  return <span className="role-member">Участник</span>;
 }
 function StatusBadge({ status }: { status: string }) {
   const kind = status === 'Активен' ? 'green' : status === 'Заблокирован' || status === 'Отозван' ? 'red' : status === 'Истёк' || status === 'Отключён' ? 'amber' : 'gray';
